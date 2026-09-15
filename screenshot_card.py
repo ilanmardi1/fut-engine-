@@ -135,12 +135,68 @@ class CardScreenshotter:
             shooter.screenshot_card(url2, "239085", "27", "out2.png")
     """
 
-    def __init__(self, viewport: tuple[int, int] = (1600, 1200), headless: bool = True):
+    # Hosts whose responses are actually needed to render a card. Anything
+    # else (analytics, ads, session replay) is aborted: it cannot affect
+    # the card's pixels and every extra request costs a round trip through
+    # the fetch-via-Python transport below.
+    ALLOWED_HOST_SUFFIXES = ("fut.gg", "fonts.googleapis.com", "fonts.gstatic.com")
+
+    def __init__(self, viewport: tuple[int, int] = (1600, 1200), headless: bool = True,
+                 fetch_via_python: bool = True):
         self.viewport = viewport
         self.headless = headless
+        # Route every request through Python's requests instead of letting
+        # Chromium open its own TLS connections.
+        #
+        # Why this exists: in a sandbox whose egress goes through a
+        # TLS-terminating proxy, Python is configured to trust the proxy's
+        # CA (REQUESTS_CA_BUNDLE etc.) but Chromium is not, so every
+        # page.goto() dies with ERR_CERT_AUTHORITY_INVALID before any card
+        # logic runs -- and because a failed screenshot is a silent
+        # fall-through here, that surfaced as blank cards rather than an
+        # error. Fulfilling each request from Python keeps verification
+        # fully ON (Python still validates against the proxy CA); it just
+        # moves who opens the socket. Set fetch_via_python=False to let
+        # Chromium talk to the network directly.
+        self.fetch_via_python = fetch_via_python
+        self._session = None
         self._pw = None
         self._browser = None
         self._page = None
+
+    def _install_python_transport(self, page) -> None:
+        import requests as _requests
+        from urllib.parse import urlparse
+
+        self._session = _requests.Session()
+        from fetch_ratings import USER_AGENT
+        self._session.headers.update({"User-Agent": USER_AGENT})
+
+        def _handler(route, request):
+            host = (urlparse(request.url).hostname or "").lower()
+            if not any(host == h or host.endswith("." + h) for h in self.ALLOWED_HOST_SUFFIXES):
+                route.abort()
+                return
+            try:
+                r = self._session.request(
+                    request.method, request.url,
+                    data=request.post_data_buffer, timeout=30,
+                )
+                # Drop hop-by-hop / encoding headers: requests has already
+                # decompressed the body, so passing the original
+                # content-encoding through would make Chromium try to
+                # decode it a second time.
+                headers = {k: v for k, v in r.headers.items()
+                           if k.lower() not in ("content-encoding", "content-length",
+                                                "transfer-encoding", "connection")}
+                route.fulfill(status=r.status_code, headers=headers, body=r.content)
+            except Exception:
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+
+        page.route("**/*", _handler)
 
     def __enter__(self) -> "CardScreenshotter":
         try:
@@ -154,13 +210,25 @@ class CardScreenshotter:
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=self.headless)
         self._page = self._browser.new_page(viewport={"width": self.viewport[0], "height": self.viewport[1]})
+        if self.fetch_via_python:
+            self._install_python_transport(self._page)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Routes still in flight when the page goes away raise
+        # CancelledError from Playwright's event loop; that is noise from
+        # shutdown ordering, not a failure of any screenshot.
+        if self._page:
+            try:
+                self._page.unroute_all(behavior="ignoreErrors")
+            except Exception:
+                pass
         if self._browser:
             self._browser.close()
         if self._pw:
             self._pw.stop()
+        if self._session:
+            self._session.close()
 
     def screenshot_card(
         self,
