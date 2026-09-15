@@ -125,6 +125,73 @@ def fc_year_url(detail_url: str, ea_id: str, target_year: str) -> str:
     return re.sub(rf"/\d+-{re.escape(ea_id)}/?$", f"/{target_year}-{ea_id}/", detail_url)
 
 
+
+# Finds one card inside the "FIFA History" archive.
+#
+# Two keys are needed together, confirmed against real data:
+#  * OVR + position + all six stats, because a face image alone is NOT
+#    unique -- the same historical-player-face asset is reused across the
+#    page, and matching on it unscoped resolves to the "Best Cards" strip
+#    (Dembele's FIFA 21 face hit the 91-rated special, not the 83 Rare).
+#  * the face image id, because stats alone are NOT unique either -- a
+#    promo can carry stats identical to the base Rare. Confirmed: FIFA 18
+#    had 2 stat-matches and FIFA 20 had 3, and in both cases the FIRST was
+#    a promo design; only the face id picked out the real gold Rare.
+# Requiring both yielded exactly one candidate for every year tested.
+FIND_HISTORY_CARD_JS = r"""
+(spec) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  if (!cards.length) return {error: 'no card containers in history section'};
+
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const matches = [];
+  cards.forEach((el, idx) => {
+    const t = norm(el.innerText).toUpperCase();
+    if (!t) return;
+    // "<OVR> <POS> <NAME> <val><STAT> ..." -- anchor on OVR + position.
+    const head = new RegExp('^' + spec.ovr + '\\s+' + spec.position + '\\b');
+    if (!head.test(t)) return;
+    const statsOk = Object.entries(spec.stats).every(
+      ([k, v]) => new RegExp('\\b' + v + '\\s*' + k + '\\b').test(t));
+    if (!statsOk) return;
+    if (spec.face_id) {
+      const imgs = Array.from(el.querySelectorAll('img')).map(i => i.src);
+      const hit = imgs.some(src => src.includes('/' + spec.face_id + '.'));
+      if (!hit) return;
+    }
+    matches.push(idx);
+  });
+
+  if (!matches.length) return {error: 'no card matched', ovr: spec.ovr, position: spec.position};
+  return {index: matches[0], ambiguous: matches.length > 1, count: matches.length};
+}
+"""
+
+# Strips the page's own backgrounds off the chosen card and everything
+# behind it, so the element screenshot can be taken with a real alpha
+# channel (omit_background) instead of being cut out afterwards by rembg.
+CLEAR_BACKDROP_JS = r"""
+(index) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  const el = cards[index];
+  if (!el) return false;
+  document.documentElement.style.background = 'transparent';
+  document.body.style.background = 'transparent';
+  let n = el;
+  while (n) {
+    n.style.background = 'transparent';
+    n.style.backgroundImage = n === el || el.contains(n) ? n.style.backgroundImage : 'none';
+    n.style.boxShadow = 'none';
+    n.style.border = 'none';
+    n = n.parentElement;
+  }
+  return true;
+}
+"""
+
+
 class CardScreenshotter:
     """Keeps one headless-Chromium instance open across many
     screenshot_card() calls -- use as a context manager so many players in
@@ -142,8 +209,12 @@ class CardScreenshotter:
     ALLOWED_HOST_SUFFIXES = ("fut.gg", "fonts.googleapis.com", "fonts.gstatic.com")
 
     def __init__(self, viewport: tuple[int, int] = (1600, 1200), headless: bool = True,
-                 fetch_via_python: bool = True):
+                 fetch_via_python: bool = True, device_scale_factor: float = 4.0):
         self.viewport = viewport
+        # Cards in the FIFA History archive render at only ~174x244 CSS px.
+        # Capturing at 1x would upscale badly onto a 1920x1080 slide, so
+        # screenshot at a higher device pixel ratio instead.
+        self.device_scale_factor = device_scale_factor
         self.headless = headless
         # Route every request through Python's requests instead of letting
         # Chromium open its own TLS connections.
@@ -209,7 +280,10 @@ class CardScreenshotter:
             ) from e
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=self.headless)
-        self._page = self._browser.new_page(viewport={"width": self.viewport[0], "height": self.viewport[1]})
+        self._page = self._browser.new_page(
+            viewport={"width": self.viewport[0], "height": self.viewport[1]},
+            device_scale_factor=self.device_scale_factor,
+        )
         if self.fetch_via_python:
             self._install_python_transport(self._page)
         return self
@@ -375,6 +449,69 @@ class CardScreenshotter:
                         f.write(f"Overview URL: {overview_url}\nScreenshot failed: {type(e).__name__}: {e}\n")
                 results[face_image_url] = False
 
+        return results
+
+    def screenshot_history_cards(
+        self,
+        overview_url: str,
+        requests: list,   # list of dicts: {key, ovr, position, stats, out_path}
+        debug_dir: Optional[str] = None,
+    ) -> dict:
+        """Screenshots each requested card out of the overview page's
+        "FIFA History" archive, matched by the OVR/position/stats already
+        parsed for that card (see FIND_HISTORY_CARD_JS for why face-image
+        matching is not safe here).
+
+        Navigates once, then captures every request against that same
+        loaded page. Uses Playwright's element screenshot rather than a
+        clipped page screenshot: the archive runs well below the fold, and
+        a clip cannot reach outside the viewport (the earlier attempt died
+        with "Clipped area is either empty or outside the resulting
+        image"), whereas an element screenshot scrolls itself into view.
+
+        Returns {key: True/False}. A False should fall back to the
+        hand-drawn card exactly as before."""
+        page = self._page
+        results = {r["key"]: False for r in requests}
+
+        def _debug(name: str, body: str) -> None:
+            if not debug_dir:
+                return
+            os.makedirs(debug_dir, exist_ok=True)
+            safe = re.sub(r"[^\w.-]", "_", name)
+            with open(os.path.join(debug_dir, f"history_{safe}_debug.txt"), "w", encoding="utf-8") as f:
+                f.write(body)
+
+        try:
+            self._goto_with_retry(page, overview_url)
+            # The archive is far down the page; scroll so it lays out.
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+        except Exception as e:
+            _debug("overview", f"URL: {overview_url}\nNavigation failed: {type(e).__name__}: {e}\n")
+            return results
+
+        selector = "#history .hc-card-container, #history .fut-card-container"
+        for req in requests:
+            key = req["key"]
+            try:
+                found = page.evaluate(FIND_HISTORY_CARD_JS, {
+                    "ovr": req["ovr"], "position": req["position"], "stats": req["stats"],
+                    "face_id": req.get("face_id"),
+                })
+                if "error" in found:
+                    _debug(key, f"URL: {overview_url}\nLooking for: {req}\nResult: {found}\n")
+                    continue
+                page.evaluate(CLEAR_BACKDROP_JS, found["index"])
+                os.makedirs(os.path.dirname(req["out_path"]) or ".", exist_ok=True)
+                page.locator(selector).nth(found["index"]).screenshot(
+                    path=req["out_path"], omit_background=True)
+                results[key] = True
+                if found.get("ambiguous"):
+                    print(f"  ({key}: {found['count']} cards matched those stats -- used the first)")
+            except Exception as e:
+                _debug(key, f"URL: {overview_url}\nLooking for: {req}\n"
+                            f"Screenshot failed: {type(e).__name__}: {e}\n")
         return results
 
     @staticmethod
