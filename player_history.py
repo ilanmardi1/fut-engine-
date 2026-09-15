@@ -220,7 +220,7 @@ def _normalize_for_matching(s: str) -> str:
     return "".join(c for c in normalized if not unicodedata.combining(c)).lower()
 
 
-def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optional[str]:
+def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optional[tuple]:
     """Finds a player's fut.gg overview URL (the FIFA History page) by
     name, using the ALREADY-CACHED ratings_fc27.json -- no new network
     dependency for name lookup. Works by trimming the last path segment
@@ -231,11 +231,22 @@ def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optiona
     _normalize_for_matching); if multiple players match, returns the
     first (callers wanting disambiguation should inspect ratings_pool
     themselves, same spirit as the club-name-ambiguity pattern used
-    elsewhere in this project)."""
+    elsewhere in this project).
+
+    Returns (overview_url, canonical_name) or None. Real bug this fixes:
+    an earlier version only returned the URL, so a caller rendering a
+    fallback card (for years with no real screenshot -- see
+    YearCard.has_real_screenshot_source) had nothing but the RAW search
+    string the person originally typed to use as the displayed name --
+    confirmed from a real generated card showing "Ousmane Dembele"
+    (missing the accent) when the person searched "Dembele" without
+    it. Returning the player's own correctly-spelled name from the
+    matched ratings_pool entry lets the caller render the real name
+    every time, regardless of how the person typed their search."""
     needle = _normalize_for_matching(player_name.strip())
     for p in ratings_pool:
         if needle in _normalize_for_matching(p.name):
             url = p.detail_url.rstrip("/")
             overview_url = url.rsplit("/", 1)[0] + "/"
-            return overview_url
+            return overview_url, p.name
     return None

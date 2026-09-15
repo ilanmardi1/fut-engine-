@@ -227,6 +227,88 @@ class CardScreenshotter:
                     f.write(f"URL: {detail_url}\nNavigation/screenshot failed: {type(e).__name__}: {e}\n")
             return False
 
+    def screenshot_historical_cards(
+        self,
+        overview_url: str,
+        requests: list,  # list of (face_image_url, out_path) tuples
+        debug_dir: Optional[str] = None,
+    ) -> dict:
+        """NEW capability, genuinely UNTESTED against a real live page --
+        needs verification in a real environment before being trusted.
+
+        For years with no individual detail page to screenshot (the
+        player-evolution scenario's older-year fallback case -- see
+        player_history.py's module docstring), a real, fully-styled card
+        turns out to still exist -- just rendered as part of the
+        player's OVERVIEW page's "FIFA History" section (confirmed from
+        a real screenshot of that section showing genuine polished
+        cards, not placeholders), rather than on its own dedicated URL.
+        This reuses the EXACT SAME proven container-finding heuristic
+        (FIND_CARD_CONTAINER_JS) already confirmed working for detail
+        pages, just anchored on a specific historical face image URL
+        instead of a "player-item/{year}-{id}" one.
+
+        Navigates to overview_url ONCE, then attempts every
+        (face_image_url, out_path) pair against that SAME loaded page --
+        much cheaper than a separate page load per year, and the
+        overview page already contains every year's card at once.
+
+        Returns {face_image_url: True/False} per request. A given
+        request failing (heuristic didn't find/isolate that specific
+        card correctly -- a real risk this hasn't been tested against,
+        since the older detail-page method dealt with ONE dominant card
+        per page, not several in a row/grid) should fall back to the
+        existing hand-drawn-shield path, exactly like a failed
+        screenshot_card() call already does elsewhere."""
+        page = self._page
+        results = {}
+        try:
+            self._goto_with_retry(page, overview_url)
+        except Exception as e:
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, "historical_overview_debug.txt"), "w", encoding="utf-8") as f:
+                    f.write(f"URL: {overview_url}\nNavigation failed: {type(e).__name__}: {e}\n")
+            return {face_url: False for face_url, _ in requests}
+
+        for face_image_url, out_path in requests:
+            m = re.search(r"historical-player-face/(\d+)\.", face_image_url)
+            face_src_substr = f"historical-player-face/{m.group(1)}." if m else face_image_url
+            try:
+                result = page.evaluate(FIND_CARD_CONTAINER_JS, face_src_substr)
+                if "error" in result:
+                    if debug_dir:
+                        os.makedirs(debug_dir, exist_ok=True)
+                        safe_name = re.sub(r"[^\w.-]", "_", face_src_substr)
+                        with open(os.path.join(debug_dir, f"historical_{safe_name}_debug.txt"),
+                                  "w", encoding="utf-8") as f:
+                            f.write(f"Overview URL: {overview_url}\nLooking for: {face_src_substr}\n"
+                                    f"Result: {result}\n")
+                    results[face_image_url] = False
+                    continue
+
+                rect = result["rect"]
+                pad = 16
+                clip = {
+                    "x": max(0, rect["x"] - pad),
+                    "y": max(0, rect["y"] - pad),
+                    "width": rect["width"] + pad * 2,
+                    "height": rect["height"] + pad * 2,
+                }
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                page.screenshot(path=out_path, clip=clip)
+                results[face_image_url] = True
+            except Exception as e:
+                if debug_dir:
+                    os.makedirs(debug_dir, exist_ok=True)
+                    safe_name = re.sub(r"[^\w.-]", "_", face_src_substr)
+                    with open(os.path.join(debug_dir, f"historical_{safe_name}_debug.txt"),
+                              "w", encoding="utf-8") as f:
+                        f.write(f"Overview URL: {overview_url}\nScreenshot failed: {type(e).__name__}: {e}\n")
+                results[face_image_url] = False
+
+        return results
+
     @staticmethod
     def _goto_with_retry(page, url: str, timeout_ms: int = 30000, retry_timeout_ms: int = 45000) -> None:
         """page.goto() with one retry at a longer timeout if the first

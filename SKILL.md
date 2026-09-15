@@ -126,11 +126,19 @@ Confirmed from real runs, all handled automatically already:
   data, just a different visual source. A note prints when this
   happens; no action needed.
 - **evolution**: recent years (confirmed FIFA 22 onward, varies by
-  player) get real screenshots; older years fut.gg no longer links
-  individually get the same real-stats hand-drawn fallback. This is
-  expected, not a failure -- the years just look visually different
-  from each other, which is inherent to fut.gg's own site structure,
-  not something this pipeline can change.
+  player) get real screenshots from their own detail page. Older years
+  with no individual detail page still get a real screenshot when
+  possible -- their actual card turns out to be rendered on the
+  player's overview page's "FIFA History" section, so this pipeline
+  screenshots THAT page and crops the specific card out. This is a
+  newer, less battle-tested code path than the individual-detail-page
+  screenshot method -- if it doesn't isolate a card correctly for some
+  player/year, it automatically falls back to the same real-stats
+  hand-drawn shield as before (no fake data either way, just a
+  different visual source). A note prints when a fallback happens; no
+  action needed unless it happens for EVERY older year for a player,
+  which would suggest the heuristic needs adjusting for that
+  particular page's layout.
 - **price with no --club-id/--league-id** (a fully global search):
   defaults to a 20-page safety cap since an unscoped fetch's real size
   has never been tested at full scale. The log will say if the real

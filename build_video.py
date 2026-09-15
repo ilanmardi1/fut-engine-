@@ -664,15 +664,16 @@ def run_evolution(
     writes a player/contents list alongside the slides) know exactly
     what ended up in the video without needing to re-fetch or
     re-parse anything itself."""
-    overview_url = resolve_player_overview_url(player_name, ratings_pool)
-    if not overview_url:
+    resolved = resolve_player_overview_url(player_name, ratings_pool)
+    if not resolved:
         raise SystemExit(
             f"No player matching '{player_name}' found in your local ratings_fc27.json. "
             f"Name matching is accent-insensitive and a substring match, but the player still needs "
             f"to be a current FC27 player in your local cache -- try re-running build_ratings_db.py "
             f"if they were only recently revealed."
         )
-    print(f"Found player page: {overview_url}")
+    overview_url, canonical_name = resolved
+    print(f"Found player page for {canonical_name}: {overview_url}")
 
     from fetch_ratings import fetch_page_text
     text = fetch_page_text(overview_url)
@@ -689,6 +690,40 @@ def run_evolution(
     ext = _slide_ext(transparent)
 
     shooter, cleanup = _open_screenshotter(use_screenshots)
+
+    # NEW, genuinely untested against a real live page: years with no
+    # individual detail page (the older-year fallback case) turn out to
+    # still have a real, fully-styled card -- just rendered as part of
+    # the overview page's "FIFA History" section (confirmed from a real
+    # screenshot showing genuine polished cards there, not
+    # placeholders), rather than on its own URL. Batch these into ONE
+    # navigation to the overview page (cheaper than one page load per
+    # year, and it already has every year's card on it at once) BEFORE
+    # the main per-year loop, so the loop below can just treat a
+    # success here exactly like any other real screenshot. Falls back
+    # to the existing hand-drawn shield automatically for anything that
+    # doesn't succeed here (screenshots disabled, or this specific
+    # untested heuristic not finding/isolating that particular card).
+    historical_screenshot_paths = {}
+    if shooter:
+        historical_requests = []
+        for card in year_cards:
+            if not card.has_real_screenshot_source and card.face_image_url:
+                fname = f"evolution_historical_{hashlib.md5(card.face_image_url.encode()).hexdigest()[:12]}.png"
+                cached_path = os.path.join(card_cache_dir, fname)
+                if os.path.exists(cached_path):
+                    historical_screenshot_paths[card.face_image_url] = cached_path
+                else:
+                    historical_requests.append((card.face_image_url, cached_path))
+        if historical_requests:
+            results = shooter.screenshot_historical_cards(
+                overview_url, historical_requests,
+                debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
+            )
+            for face_url, cached_path in historical_requests:
+                if results.get(face_url):
+                    historical_screenshot_paths[face_url] = cached_path
+
     try:
         for i, card in enumerate(year_cards):
             t = i * interval_seconds
@@ -720,6 +755,8 @@ def run_evolution(
                         if social_url:
                             real_card_path = _cached_download(social_url, card_cache_dir,
                                                                "evolution_social", download_fn)
+            elif card.face_image_url in historical_screenshot_paths:
+                real_card_path = historical_screenshot_paths[card.face_image_url]
 
             if real_card_path:
                 if transparent:
@@ -743,7 +780,7 @@ def run_evolution(
             build_evolution_slide(
                 out_path=out_path,
                 year_label=card.year_label,
-                player_name=player_name,
+                player_name=canonical_name,
                 position=card.position or "?",
                 ovr=card.ovr or 0,
                 stats=card.stats,
