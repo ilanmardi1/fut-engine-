@@ -108,6 +108,10 @@ def _slide_ext(transparent: bool) -> str:
     return ".png" if transparent else ".jpg"
 
 
+def _slugify_year(label: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in label).strip("_")
+
+
 def _has_real_alpha(path: Optional[str]) -> bool:
     """True when an image already carries a meaningful alpha channel.
     fut.gg's standalone card assets arrive pre-cut with transparency, so
@@ -723,81 +727,89 @@ def run_evolution(
     # to the existing hand-drawn shield automatically for anything that
     # doesn't succeed here (screenshots disabled, or this specific
     # untested heuristic not finding/isolating that particular card).
-    historical_screenshot_paths = {}
-    if shooter:
-        historical_requests = []
-        for card in year_cards:
-            if not card.has_real_screenshot_source and card.face_image_url:
-                fname = f"evolution_historical_{hashlib.md5(card.face_image_url.encode()).hexdigest()[:12]}.png"
-                cached_path = os.path.join(card_cache_dir, fname)
-                if os.path.exists(cached_path):
-                    historical_screenshot_paths[card.face_image_url] = cached_path
-                else:
-                    historical_requests.append((card.face_image_url, cached_path))
-        if historical_requests:
-            results = shooter.screenshot_historical_cards(
-                overview_url, historical_requests,
-                debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
-            )
-            for face_url, cached_path in historical_requests:
-                if results.get(face_url):
-                    historical_screenshot_paths[face_url] = cached_path
+    # Resolve a real card image for every year BEFORE drawing any slide,
+    # cheapest source first, so the loop below is pure rendering.
+    #
+    # Tier 1 -- fut.gg's standalone card asset: a plain HTTP fetch, no
+    # browser, and a real alpha channel already baked in. Confirmed
+    # present for EA FC 24-27 and absent for FIFA 22/23.
+    card_paths = {}       # year_label -> local image path
+    card_sources = {}     # year_label -> how it was actually obtained
+    for card in year_cards:
+        if not card.detail_url:
+            continue
+        m = YEAR_DETAIL_URL_RE.search(card.detail_url)
+        if not m:
+            continue
+        game_year, item_id = m.group(1), m.group(2)
+        try:
+            card_url = fetch_card_image_url(card.detail_url, game_year, item_id)
+        except Exception as e:
+            print(f"  ({card.year_label}: card-image lookup failed: {type(e).__name__}: {e})")
+            continue
+        if not card_url:
+            continue
+        path = _cached_download(card_url, card_cache_dir, "evolution_card", download_fn)
+        if path:
+            card_paths[card.year_label] = path
+            card_sources[card.year_label] = "fut.gg card image"
+
+    # Tier 2 -- older years exist ONLY as HTML on the overview page's FIFA
+    # History archive: there is no downloadable card asset for them at all
+    # (the per-year social image 403s before 2022). Screenshot them out of
+    # that archive, all in a single page load.
+    pending = [c for c in year_cards
+               if c.year_label not in card_paths and c.ovr and c.position and c.stats]
+    if shooter and pending:
+        reqs = []
+        for c in pending:
+            face_id = ""
+            if c.face_image_url:
+                face_id = c.face_image_url.rstrip("/").split("/")[-1].split(".")[0]
+            out_path = os.path.join(
+                card_cache_dir,
+                f"evolution_history_{_slugify_year(c.year_label)}_{face_id or 'na'}.png")
+            if os.path.exists(out_path):
+                card_paths[c.year_label] = out_path
+                card_sources[c.year_label] = "fut.gg history card"
+                continue
+            reqs.append({"key": c.year_label, "ovr": c.ovr, "position": c.position,
+                         "stats": c.stats, "face_id": face_id, "out_path": out_path})
+        if reqs:
+            results = shooter.screenshot_history_cards(
+                overview_url, reqs,
+                debug_dir=os.path.join(card_cache_dir, "screenshot_debug"))
+            for r in reqs:
+                if results.get(r["key"]):
+                    card_paths[r["key"]] = r["out_path"]
+                    card_sources[r["key"]] = "fut.gg history card"
 
     try:
         for i, card in enumerate(year_cards):
             t = i * interval_seconds
             out_path = os.path.join(slides_dir, f"{_mmss(t)}{ext}")
 
-            real_card_path = None
-            source_used = None
-            if card.has_real_screenshot_source:
+            real_card_path = card_paths.get(card.year_label)
+            source_used = card_sources.get(card.year_label)
+
+            # Tier 3 -- fut.gg's social preview, a last resort before we
+            # draw the card ourselves.
+            if not real_card_path and card.detail_url:
                 m = YEAR_DETAIL_URL_RE.search(card.detail_url)
                 if m:
-                    game_year, item_id = m.group(1), m.group(2)
-                    # Tier 1 (preferred): fut.gg's own standalone card
-                    # asset -- no browser needed, and already transparent,
-                    # so it is both faster AND cleaner than a screenshot.
+                    fake_player = PlayerRating(
+                        ea_id=m.group(2), name=canonical_name, club="", position="",
+                        ovr=card.ovr or 0, stats={}, detail_url=card.detail_url,
+                    )
                     try:
-                        card_url = fetch_card_image_url(card.detail_url, game_year, item_id)
-                    except Exception as e:
-                        print(f"  ({card.year_label}: card-image lookup failed: "
-                              f"{type(e).__name__}: {e})")
-                        card_url = None
-                    if card_url:
-                        real_card_path = _cached_download(card_url, card_cache_dir,
-                                                          "evolution_card", download_fn)
-                        if real_card_path:
-                            source_used = "fut.gg card image"
-                    # Tier 2: browser screenshot of the detail page.
-                    if not real_card_path:
-                        real_card_path = _cached_screenshot(
-                            shooter, card.detail_url, item_id, game_year,
-                            card_cache_dir, debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
-                        )
-                        if real_card_path:
-                            source_used = "real screenshot"
-                    if not real_card_path:
-                        # Screenshot disabled or failed for this linked
-                        # year -- unlike the older/unlinked years, a
-                        # linked year carries no scraped stats/face of
-                        # its own to fall back to (the parser only
-                        # captured its detail_url), so the social-preview
-                        # card (same middle-tier fallback run_price
-                        # already uses) is the difference between a
-                        # real card image and a near-blank placeholder.
-                        fake_player = PlayerRating(
-                            ea_id=item_id, name=player_name, club="", position="",
-                            ovr=card.ovr or 0, stats={}, detail_url=card.detail_url,
-                        )
                         social_url = fetch_social_card_url(fake_player)
-                        if social_url:
-                            real_card_path = _cached_download(social_url, card_cache_dir,
-                                                               "evolution_social", download_fn)
-                            if real_card_path:
-                                source_used = "fut.gg social preview"
-            elif card.face_image_url in historical_screenshot_paths:
-                real_card_path = historical_screenshot_paths[card.face_image_url]
-                source_used = "real screenshot (history section)"
+                    except Exception:
+                        social_url = None
+                    if social_url:
+                        real_card_path = _cached_download(social_url, card_cache_dir,
+                                                          "evolution_social", download_fn)
+                        if real_card_path:
+                            source_used = "fut.gg social preview"
 
             if real_card_path:
                 if transparent:

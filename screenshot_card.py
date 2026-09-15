@@ -177,16 +177,38 @@ CLEAR_BACKDROP_JS = r"""
   const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
   const el = cards[index];
   if (!el) return false;
+  // Remember each element's own inline style so it can be put back. The
+  // ancestors here are SHARED between cards, so leaving them stripped
+  // reflows the page for every later capture -- that is what clipped one
+  // card's OVR block off in a batch run while it captured fine alone.
+  const stash = (n) => {
+    if (n.dataset.futPrevStyle === undefined) {
+      n.dataset.futPrevStyle = n.getAttribute('style') || '';
+    }
+  };
+  stash(document.documentElement); stash(document.body);
   document.documentElement.style.background = 'transparent';
   document.body.style.background = 'transparent';
-  let n = el;
+  let n = el.parentElement;
   while (n) {
+    stash(n);
     n.style.background = 'transparent';
-    n.style.backgroundImage = n === el || el.contains(n) ? n.style.backgroundImage : 'none';
+    n.style.backgroundImage = 'none';
     n.style.boxShadow = 'none';
     n.style.border = 'none';
     n = n.parentElement;
   }
+  return true;
+}
+"""
+
+RESTORE_BACKDROP_JS = r"""
+() => {
+  document.querySelectorAll('[data-fut-prev-style]').forEach(n => {
+    const prev = n.dataset.futPrevStyle;
+    if (prev) { n.setAttribute('style', prev); } else { n.removeAttribute('style'); }
+    delete n.dataset.futPrevStyle;
+  });
   return true;
 }
 """
@@ -502,10 +524,22 @@ class CardScreenshotter:
                 if "error" in found:
                     _debug(key, f"URL: {overview_url}\nLooking for: {req}\nResult: {found}\n")
                     continue
-                page.evaluate(CLEAR_BACKDROP_JS, found["index"])
+                loc = page.locator(selector).nth(found["index"])
+                # Scroll first, THEN clear backdrops: clearing backgrounds on
+                # shared ancestors reflows the page, so a card measured
+                # before that can end up captured half off its own box.
                 os.makedirs(os.path.dirname(req["out_path"]) or ".", exist_ok=True)
-                page.locator(selector).nth(found["index"]).screenshot(
-                    path=req["out_path"], omit_background=True)
+                page.evaluate(CLEAR_BACKDROP_JS, found["index"])
+                try:
+                    # Scroll AFTER clearing: stripping backgrounds reflows
+                    # the page, so a position measured before that is stale.
+                    loc.scroll_into_view_if_needed()
+                    page.wait_for_timeout(250)
+                    loc.screenshot(path=req["out_path"], omit_background=True)
+                finally:
+                    # Always put the page back, so the next card in this
+                    # batch measures against the original layout.
+                    page.evaluate(RESTORE_BACKDROP_JS)
                 results[key] = True
                 if found.get("ambiguous"):
                     print(f"  ({key}: {found['count']} cards matched those stats -- used the first)")
