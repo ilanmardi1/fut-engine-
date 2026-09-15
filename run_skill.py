@@ -220,8 +220,13 @@ def main():
                                     args.interval_seconds, style,
                                     use_screenshots=not args.no_screenshots, transparent=True)
         for i, c in enumerate(year_cards):
-            source = "real screenshot" if c.has_real_screenshot_source else \
-                     "hand-drawn (real stats, no fut.gg detail page for this year)"
+            # Report the source that ACTUALLY produced the slide, not the
+            # one we hoped for -- a failed card/screenshot fetch silently
+            # falls back, and the contents list must not claim otherwise.
+            source = c.source_used or (
+                "real screenshot" if c.has_real_screenshot_source
+                else "hand-drawn (real stats, no fut.gg detail page for this year)"
+            )
             ovr_text = f"{c.ovr} OVR, " if c.ovr else ""
             players_lines.append(f"{i+1}. {c.year_label} -- {ovr_text}{source}")
         contents_label = _slugify(args.player_name)

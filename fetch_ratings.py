@@ -439,6 +439,49 @@ SOCIAL_CARD_RE = re.compile(
 DELTA_RE = re.compile(r"(?P<sign>[+-])(?P<amt>\d+)\s*(?P<stat>OVR|PAC|SHO|PAS|DRI|DEF|PHY|DIV|HAN|KIC|REF|SPD|POS)")
 
 
+# fut.gg renders a standalone, already-transparent card image for each
+# player-item and serves it straight off its CDN, e.g.
+#   .../2027/futgg-player-item-card/27-231443.<hash>.webp
+# Confirmed live (2026-09) for EA FC 24-27; FIFA 22/23 detail pages carry
+# no such asset, so callers must keep a fallback for those years. This is
+# a strictly better card source than a browser screenshot: no browser at
+# all, and it arrives pre-cut with a real alpha channel, so it needs no
+# background removal either.
+CARD_IMAGE_RE_TMPL = (
+    r"https://game-assets\.fut\.gg/cdn-cgi/image/[^\"'\\\s]*?"
+    r"/futgg-player-item-card/{year}-{ea_id}\.[a-f0-9]+\.\w+"
+)
+
+
+def fetch_page_html(url: str, session: Optional[requests.Session] = None) -> str:
+    """Raw HTML, unlike fetch_page_text() which reduces a page to a text
+    stream. Needed for anything living in an attribute or a <head> meta
+    tag -- BeautifulSoup's get_text() drops those entirely. (That is
+    exactly why fetch_social_card_url below, which searches the TEXT
+    stream for a "meta-og:image:" line, can never match on the live
+    site.)"""
+    sess = session or requests.Session()
+    resp = sess.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp.raise_for_status()
+    return resp.text
+
+
+def fetch_card_image_url(detail_url: str, game_year: str, ea_id: str,
+                         width: int = 900,
+                         session: Optional[requests.Session] = None) -> Optional[str]:
+    """Returns fut.gg's own standalone card image URL for one player-item,
+    upscaled to `width` via the cdn-cgi image params already in the URL.
+    Returns None when that year's page carries no such asset (confirmed
+    real for FIFA 22/23) -- callers should fall back, not treat it as an
+    error."""
+    html = fetch_page_html(detail_url, session)
+    pattern = CARD_IMAGE_RE_TMPL.format(year=re.escape(game_year), ea_id=re.escape(ea_id))
+    m = re.search(pattern, html)
+    if not m:
+        return None
+    return re.sub(r"width=\d+", f"width={width}", m.group(0))
+
+
 def fetch_social_card_url(player: PlayerRating, session: Optional[requests.Session] = None) -> Optional[str]:
     """Fetches player.detail_url and pulls out fut.gg's own fully-rendered
     social-preview card image URL (see SOCIAL_CARD_RE above). Returns

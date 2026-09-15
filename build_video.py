@@ -78,6 +78,7 @@ import requests
 from fetch_ratings import (
     PlayerRating, load_ratings_db, higher_res_card_url,
     fetch_comparison_card, fetch_social_card_url, club_entity_id, league_entity_id,
+    fetch_card_image_url,
 )
 from assets import download_image
 from compositor import (
@@ -105,6 +106,24 @@ def _slide_ext(transparent: bool) -> str:
     non-transparent slides stay JPG as before (smaller files, and
     capcut_build.py's filename regex already accepts both)."""
     return ".png" if transparent else ".jpg"
+
+
+def _has_real_alpha(path: Optional[str]) -> bool:
+    """True when an image already carries a meaningful alpha channel.
+    fut.gg's standalone card assets arrive pre-cut with transparency, so
+    pushing them through rembg would be slow at best, and would eat into
+    the card's own edges at worst."""
+    if not path:
+        return False
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            if im.mode not in ("RGBA", "LA"):
+                return False
+            lo, _hi = im.convert("RGBA").getchannel("A").getextrema()
+            return lo == 0          # genuinely transparent pixels present
+    except Exception:
+        return False
 
 
 def _cached_bg_removed(source_path: Optional[str], cache_dir: str, prefix: str) -> Optional[str]:
@@ -730,14 +749,33 @@ def run_evolution(
             out_path = os.path.join(slides_dir, f"{_mmss(t)}{ext}")
 
             real_card_path = None
+            source_used = None
             if card.has_real_screenshot_source:
                 m = YEAR_DETAIL_URL_RE.search(card.detail_url)
                 if m:
                     game_year, item_id = m.group(1), m.group(2)
-                    real_card_path = _cached_screenshot(
-                        shooter, card.detail_url, item_id, game_year,
-                        card_cache_dir, debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
-                    )
+                    # Tier 1 (preferred): fut.gg's own standalone card
+                    # asset -- no browser needed, and already transparent,
+                    # so it is both faster AND cleaner than a screenshot.
+                    try:
+                        card_url = fetch_card_image_url(card.detail_url, game_year, item_id)
+                    except Exception as e:
+                        print(f"  ({card.year_label}: card-image lookup failed: "
+                              f"{type(e).__name__}: {e})")
+                        card_url = None
+                    if card_url:
+                        real_card_path = _cached_download(card_url, card_cache_dir,
+                                                          "evolution_card", download_fn)
+                        if real_card_path:
+                            source_used = "fut.gg card image"
+                    # Tier 2: browser screenshot of the detail page.
+                    if not real_card_path:
+                        real_card_path = _cached_screenshot(
+                            shooter, card.detail_url, item_id, game_year,
+                            card_cache_dir, debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
+                        )
+                        if real_card_path:
+                            source_used = "real screenshot"
                     if not real_card_path:
                         # Screenshot disabled or failed for this linked
                         # year -- unlike the older/unlinked years, a
@@ -755,18 +793,26 @@ def run_evolution(
                         if social_url:
                             real_card_path = _cached_download(social_url, card_cache_dir,
                                                                "evolution_social", download_fn)
+                            if real_card_path:
+                                source_used = "fut.gg social preview"
             elif card.face_image_url in historical_screenshot_paths:
                 real_card_path = historical_screenshot_paths[card.face_image_url]
+                source_used = "real screenshot (history section)"
 
             if real_card_path:
                 if transparent:
-                    nobg_path = _cached_bg_removed(real_card_path, card_cache_dir, "evolution")
+                    if _has_real_alpha(real_card_path):
+                        nobg_path = real_card_path   # already cut out by fut.gg
+                    else:
+                        nobg_path = _cached_bg_removed(real_card_path, card_cache_dir, "evolution")
                     if nobg_path:
+                        card.source_used = source_used
                         build_evolution_slide_from_photo(out_path=out_path, year_label=card.year_label,
                                                           real_card_path=nobg_path, style=style, transparent=True)
                         continue
                     # bg removal failed -- fall through to the hand-drawn fallback below.
                 else:
+                    card.source_used = source_used
                     build_evolution_slide_from_photo(out_path=out_path, year_label=card.year_label,
                                                       real_card_path=real_card_path, style=style)
                     continue
@@ -777,6 +823,8 @@ def run_evolution(
             face_path = None
             if card.face_image_url:
                 face_path = _cached_download(card.face_image_url, card_cache_dir, "evolution_face", download_fn)
+            card.source_used = ("hand-drawn (real stats from fut.gg)" if card.stats
+                                else "hand-drawn (NO stats available)")
             build_evolution_slide(
                 out_path=out_path,
                 year_label=card.year_label,

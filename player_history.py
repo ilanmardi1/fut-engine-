@@ -35,8 +35,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-YEAR_HEADER_RE = re.compile(r"^###\s+.+?\s+in\s+(EA FC (\d+)|FIFA (\d+))\s*$")
-LINK_ENTRY_RE = re.compile(r"^\[(.+?)\]\((https://www\.fut\.gg/players/[^)]+)\)$")
+# fut.gg dropped the "### " markdown-heading prefix on these year
+# headers (confirmed live 2026-09: the line is now just
+# "<Name> in EA FC 27"), so the prefix is optional here.
+YEAR_HEADER_RE = re.compile(r"^(?:###\s+)?.+?\s+in\s+(EA FC (\d+)|FIFA (\d+))\s*$")
+# Card links in the FIFA History section are now site-relative
+# ("/players/231443-ousmane-dembele/27-231443/") rather than
+# absolute; accept both and normalise to absolute below.
+LINK_ENTRY_RE = re.compile(r"^\[(.+?)\]\(((?:https://www\.fut\.gg)?/players/[^)]+)\)$")
 IMAGE_ENTRY_RE = re.compile(
     r"^!\[.*?\]\((https://game-assets\.fut\.gg/cdn-cgi/image/[^)]*?/historical-player-face/[^)]+)\)$"
 )
@@ -53,6 +59,10 @@ class YearCard:
     ovr: Optional[int] = None
     position: Optional[str] = None
     stats: dict = field(default_factory=dict)
+    # Set by the builder to whatever card source ACTUALLY produced
+    # this slide, so the contents list can report the truth rather
+    # than re-deriving an intention from has_real_screenshot_source.
+    source_used: Optional[str] = None
 
     @property
     def has_real_screenshot_source(self) -> bool:
@@ -112,6 +122,42 @@ def _parse_entry_meta(entry_lines: list) -> dict:
     return {"ovr": ovr, "position": position, "stats": stats}
 
 
+INLINE_FACE_RE = re.compile(
+    r"!\[[^\]]*\]\((https://game-assets\.fut\.gg/[^)]*?/(?:historical-player-face|players)/[^)]+)\)"
+)
+INLINE_OVR_POS_RE = re.compile(r"(?<![\d])(\d{2,3})\s*([A-Z]{2,3})(?![A-Za-z])")
+
+
+def _parse_link_entry_meta(label: str) -> dict:
+    """Linked years put the whole card on ONE line, e.g.
+        [![Dembele](.../2022/players/231443.png)83RW![Nation](..)![Club](..)Dembele93PAC86DRI77SHO...](url)
+    so face/OVR/position/stats are all recoverable without another
+    request. The old parser kept only the URL and threw this away, which
+    left a linked year with NO usable fallback when its card image and
+    screenshot both failed -- producing a blank 0-OVR card. Confirmed
+    live (2026-09) against FIFA 22 and 23, the two years that have a
+    detail page but no standalone card asset."""
+    face_m = INLINE_FACE_RE.search(label)
+    face_url = face_m.group(1) if face_m else None
+
+    # Drop every ![alt](url) so image URLs can't be mined for digits.
+    stripped = re.sub(r"!\[[^\]]*\]\([^)]*\)", "|", label)
+
+    stats = {}
+    for value, name in COMBINED_STAT_RE.findall(stripped):
+        stats.setdefault(name.upper(), int(value))
+
+    # OVR/position is the first "<number><POS>" pair that is NOT a stat token.
+    ovr = position = None
+    for value, token in INLINE_OVR_POS_RE.findall(stripped):
+        if token.upper() in STAT_NAMES:
+            continue
+        ovr, position = int(value), token.upper()
+        break
+
+    return {"face_url": face_url, "ovr": ovr, "position": position, "stats": stats}
+
+
 def parse_fifa_history_page(text: str) -> list:
     """Returns one YearCard per year found, for the card explicitly
     labeled "Rare" in that year (exact match, case-insensitive -- never
@@ -124,15 +170,21 @@ def parse_fifa_history_page(text: str) -> list:
 
     entry_kind = None   # "link" or "image" or None
     entry_url = None
+    entry_label = None
     entry_face_url = None
     entry_lines: list = []
 
     def make_card_for_current_entry():
         if entry_kind == "link":
+            meta = _parse_link_entry_meta(entry_label or "")
             return YearCard(
                 year_label=current_year_label,
                 year_sort_key=_year_label_to_sort_key(current_year_label),
                 detail_url=entry_url,
+                face_image_url=meta["face_url"],
+                ovr=meta["ovr"],
+                position=meta["position"],
+                stats=meta["stats"],
             )
         meta = _parse_entry_meta(entry_lines)
         return YearCard(
@@ -164,6 +216,7 @@ def parse_fifa_history_page(text: str) -> list:
         if year_m:
             current_year_label = year_m.group(1)
             entry_kind, entry_url, entry_face_url, entry_lines = None, None, None, []
+            entry_label = None
             continue
 
         if current_year_label is None:
@@ -171,11 +224,16 @@ def parse_fifa_history_page(text: str) -> list:
 
         link_m = LINK_ENTRY_RE.match(line)
         if link_m:
-            entry_kind, entry_url, entry_face_url, entry_lines = "link", link_m.group(2), None, []
+            href = link_m.group(2)
+            if href.startswith("/"):
+                href = "https://www.fut.gg" + href
+            entry_label = link_m.group(1)
+            entry_kind, entry_url, entry_face_url, entry_lines = "link", href, None, []
             continue
 
         img_m = IMAGE_ENTRY_RE.match(line)
         if img_m:
+            entry_label = None
             entry_kind, entry_url, entry_face_url, entry_lines = "image", None, img_m.group(1), []
             continue
 

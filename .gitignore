@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Local crawl cache / seeds -- rebuilt via build_ratings_db.py, not source
+ratings_fc27.json
+ratings_seed_*.json
