@@ -189,6 +189,18 @@ CLEAR_BACKDROP_JS = r"""
   stash(document.documentElement); stash(document.body);
   document.documentElement.style.background = 'transparent';
   document.body.style.background = 'transparent';
+
+  // Hide sticky/fixed chrome. scroll_into_view_if_needed can park a card
+  // underneath fut.gg's sticky site header, and an element screenshot
+  // still captures whatever paints ON TOP of the element's box -- that is
+  // what put a dark strip across one year's OVR/position block.
+  document.querySelectorAll('body *').forEach(n => {
+    const pos = getComputedStyle(n).position;
+    if (pos === 'fixed' || pos === 'sticky') {
+      stash(n);
+      n.style.visibility = 'hidden';
+    }
+  });
   let n = el.parentElement;
   while (n) {
     stash(n);
@@ -529,12 +541,11 @@ class CardScreenshotter:
                 # shared ancestors reflows the page, so a card measured
                 # before that can end up captured half off its own box.
                 os.makedirs(os.path.dirname(req["out_path"]) or ".", exist_ok=True)
+                loc.scroll_into_view_if_needed()
+                page.wait_for_timeout(200)
                 page.evaluate(CLEAR_BACKDROP_JS, found["index"])
                 try:
-                    # Scroll AFTER clearing: stripping backgrounds reflows
-                    # the page, so a position measured before that is stale.
-                    loc.scroll_into_view_if_needed()
-                    page.wait_for_timeout(250)
+                    page.wait_for_timeout(150)
                     loc.screenshot(path=req["out_path"], omit_background=True)
                 finally:
                     # Always put the page back, so the next card in this
