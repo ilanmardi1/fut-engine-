@@ -46,8 +46,17 @@ LINK_ENTRY_RE = re.compile(r"^\[(.+?)\]\(((?:https://www\.fut\.gg)?/players/[^)]
 IMAGE_ENTRY_RE = re.compile(
     r"^!\[.*?\]\((https://game-assets\.fut\.gg/cdn-cgi/image/[^)]*?/historical-player-face/[^)]+)\)$"
 )
-STAT_NAMES = {"PAC", "SHO", "PAS", "DRI", "DEF", "PHY"}
-COMBINED_STAT_RE = re.compile(r"(\d{1,3})\s*(PAC|SHO|PAS|DRI|DEF|PHY)", re.IGNORECASE)
+# Outfield AND goalkeeper stat codes. Keeping this outfield-only meant a
+# keeper's cards parsed with an EMPTY stats dict, so every pre-FC24 year
+# fell through to a hand-drawn card labelled "NO stats available" --
+# confirmed against Donnarumma, whose FIFA 17-23 slides all came out that
+# way. GK cards use DIV/HAN/KIC/REF/SPD/POS in place of PAC/SHO/PAS/DRI/
+# DEF/PHY.
+OUTFIELD_STAT_NAMES = {"PAC", "SHO", "PAS", "DRI", "DEF", "PHY"}
+GK_STAT_NAMES = {"DIV", "HAN", "KIC", "REF", "SPD", "POS"}
+STAT_NAMES = OUTFIELD_STAT_NAMES | GK_STAT_NAMES
+COMBINED_STAT_RE = re.compile(
+    r"(\d{1,3})\s*(PAC|SHO|PAS|DRI|DEF|PHY|DIV|HAN|KIC|REF|SPD|POS)", re.IGNORECASE)
 
 
 @dataclass
@@ -278,7 +287,75 @@ def _normalize_for_matching(s: str) -> str:
     return "".join(c for c in normalized if not unicodedata.combining(c)).lower()
 
 
-def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optional[tuple]:
+def _rank_index_matches(needle: str, hits: list) -> list:
+    """Orders sitemap hits so the obvious player wins. `hits` is a list of
+    (position, entry) where position is the entry's index in the sitemap.
+
+    Real ambiguity this has to survive: "dembele" matches Ousmane, Fatou
+    AND Karamoko; "mbappe" matches Kylian and Ethan.
+
+    Ties break on sitemap POSITION, which fut.gg orders by prominence --
+    verified: Kylian Mbappe sits at 20 and Ethan at 3208, Ousmane Dembele
+    at 44 against Fatou at 7466, Erling Haaland at 19 against Markus at
+    16019. An earlier version broke ties on the shorter name and duly
+    picked Ethan Mbappe for "Mbappe", which is exactly the wrong answer.
+    """
+    def score(item):
+        position, entry = item
+        name = _normalize_for_matching(entry["name"])
+        if name == needle:
+            tier = 0
+        elif name.split() and name.split()[-1] == needle:
+            tier = 1
+        elif name.startswith(needle + " ") or name.endswith(" " + needle):
+            tier = 2
+        else:
+            tier = 3
+        return (tier, position)
+    return [entry for _pos, entry in sorted(hits, key=score)]
+
+
+def resolve_player_from_index(player_name: str, index: list) -> Optional[tuple]:
+    """Name -> (overview_url, display_name) using the sitemap-derived player
+    index, for when the local ratings cache cannot answer. Prints the other
+    candidates when the name is ambiguous rather than silently guessing --
+    the caller can then re-run with a fuller name."""
+    needle = _normalize_for_matching(player_name.strip())
+    if not needle:
+        return None
+    hits = [(i, e) for i, e in enumerate(index)
+            if needle in _normalize_for_matching(e["name"])]
+    if not hits:
+        return None
+    ranked = _rank_index_matches(needle, hits)
+    best = ranked[0]
+    if len(ranked) > 1:
+        others = ", ".join(e["name"].title() for e in ranked[1:6])
+        print(f"  ('{player_name}' also matches: {others}"
+              f"{' ...' if len(ranked) > 6 else ''} -- using {best['name'].title()}; "
+              f"pass a fuller name to pick another)")
+    return best["overview_url"], best["name"].title()
+
+
+PLAYER_DISPLAY_NAME_RE = re.compile(
+    r"\[Players\]\(/players/\)\s*\n\s*/\s*\n\s*(?P<name>[^\n]+)"
+)
+
+
+def parse_player_display_name(text: str) -> Optional[str]:
+    """The player's correctly-accented name from their overview page's
+    breadcrumb. The sitemap slug is accent-stripped ("ousmane-dembele"), so
+    without this a sitemap-resolved player would render as "Ousmane Dembele"
+    on any hand-drawn card."""
+    m = PLAYER_DISPLAY_NAME_RE.search(text)
+    if not m:
+        return None
+    name = m.group("name").strip()
+    return name or None
+
+
+def resolve_player_overview_url(player_name: str, ratings_pool: list,
+                                fallback_index: Optional[list] = None) -> Optional[tuple]:
     """Finds a player's fut.gg overview URL (the FIFA History page) by
     name, using the ALREADY-CACHED ratings_fc27.json -- no new network
     dependency for name lookup. Works by trimming the last path segment
@@ -307,4 +384,9 @@ def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optiona
             url = p.detail_url.rstrip("/")
             overview_url = url.rsplit("/", 1)[0] + "/"
             return overview_url, p.name
+    # Nothing in the local ratings cache. That cache is currently empty for
+    # everyone whose build_ratings_db.py run failed, so fall back to the
+    # sitemap index, which needs no ratings data to answer.
+    if fallback_index:
+        return resolve_player_from_index(player_name, fallback_index)
     return None

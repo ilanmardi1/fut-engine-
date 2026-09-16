@@ -453,6 +453,83 @@ CARD_IMAGE_RE_TMPL = (
 )
 
 
+# fut.gg publishes every player's detail URL in a paginated sitemap, which
+# is a far sturdier name -> URL lookup than scraping a ratings listing: it
+# is a stable, documented surface (linked from robots.txt) rather than a
+# rendered page whose markup changes. Confirmed live 2026-09: 22 sitemap
+# pages, 20,150 base players, ~20s to walk the lot.
+#
+# NOTE this carries NO ratings or stats -- only identity (ea_id, slug,
+# URL). It is enough for the evolution scenario, which needs just the
+# player's page, and is NOT a replacement for build_ratings_db.py, which
+# the stat-driven scenarios still need.
+SITEMAP_INDEX_URL = "https://www.fut.gg/sitemap.xml"
+PLAYER_DETAIL_URL_RE = re.compile(
+    r"^https://www\.fut\.gg/players/(?P<ea_id>\d+)-(?P<slug>[a-z0-9\-]+)/(?P<year>\d+)-(?P<item_id>\d+)/$"
+)
+
+
+def fetch_player_index(game_year: str = "27", cache_path: Optional[str] = None,
+                       session: Optional[requests.Session] = None,
+                       refresh: bool = False) -> list[dict]:
+    """Every base player for a game year, as
+    [{"ea_id", "slug", "name", "overview_url"}, ...].
+
+    Only entries whose item id equals the player's ea_id are kept -- those
+    are the base player items; every other id under the same slug is a
+    promo/special variant pointing at the same overview page.
+
+    Cached to disk (cache_path) because the walk costs ~20s; pass
+    refresh=True to rebuild."""
+    import json
+
+    if cache_path and not refresh and os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached:
+                return cached
+        except Exception:
+            pass   # unreadable cache is not fatal -- just rebuild it
+
+    sess = session or requests.Session()
+    index_xml = fetch_page_html(SITEMAP_INDEX_URL, sess)
+    maps = [u for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+            if f"player-detail-{game_year}" in u]
+    if not maps:
+        raise RuntimeError(
+            f"No player sitemap for game year {game_year} at {SITEMAP_INDEX_URL} -- "
+            f"fut.gg may have renamed it.")
+
+    players = {}
+    for map_url in maps:
+        try:
+            xml = fetch_page_html(map_url, sess)
+        except Exception as e:
+            print(f"  (sitemap page failed: {map_url} -- {type(e).__name__}: {e})")
+            continue
+        for loc in re.findall(r"<loc>([^<]+)</loc>", xml):
+            m = PLAYER_DETAIL_URL_RE.match(loc)
+            if not m or m.group("ea_id") != m.group("item_id"):
+                continue
+            slug = m.group("slug")
+            players[m.group("ea_id")] = {
+                "ea_id": m.group("ea_id"),
+                "slug": slug,
+                "name": slug.replace("-", " "),
+                "overview_url": f"https://www.fut.gg/players/{m.group('ea_id')}-{slug}/",
+            }
+
+    result = list(players.values())
+    if cache_path and result:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f)
+        except Exception as e:
+            print(f"  (could not cache player index: {type(e).__name__}: {e})")
+    return result
+
+
 def fetch_page_html(url: str, session: Optional[requests.Session] = None) -> str:
     """Raw HTML, unlike fetch_page_text() which reduces a page to a text
     stream. Needed for anything living in an attribute or a <head> meta

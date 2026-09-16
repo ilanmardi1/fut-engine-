@@ -213,9 +213,15 @@ def main():
         contents_label = "price_prediction"
 
     elif args.scenario == "evolution":
-        if not os.path.exists(args.ratings_db):
-            raise SystemExit(f"No ratings database found at '{args.ratings_db}'. Run: python build_ratings_db.py")
-        ratings_pool = load_ratings_db(args.ratings_db)
+        # Unlike the stat-driven scenarios, evolution only needs the player's
+        # PAGE, and can resolve that from fut.gg's sitemap index. So a missing
+        # ratings cache is not fatal here -- it just means the slower lookup.
+        if os.path.exists(args.ratings_db):
+            ratings_pool = load_ratings_db(args.ratings_db)
+        else:
+            print(f"(no ratings cache at '{args.ratings_db}' -- resolving the player "
+                  f"from fut.gg's player index instead)")
+            ratings_pool = []
         year_cards = run_evolution(args.player_name, ratings_pool, slides_dir, card_cache_dir,
                                     args.interval_seconds, style,
                                     use_screenshots=not args.no_screenshots, transparent=True)

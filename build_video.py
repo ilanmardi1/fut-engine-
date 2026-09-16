@@ -79,6 +79,7 @@ from fetch_ratings import (
     PlayerRating, load_ratings_db, higher_res_card_url,
     fetch_comparison_card, fetch_social_card_url, club_entity_id, league_entity_id,
     fetch_card_image_url,
+    fetch_player_index,
 )
 from assets import download_image
 from compositor import (
@@ -687,10 +688,21 @@ def run_evolution(
     writes a player/contents list alongside the slides) know exactly
     what ended up in the video without needing to re-fetch or
     re-parse anything itself."""
-    resolved = resolve_player_overview_url(player_name, ratings_pool)
+    # The local ratings cache is the fast path; the sitemap index is what
+    # makes this work at all when that cache is empty or stale.
+    try:
+        player_index = fetch_player_index(
+            cache_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "players_index_fc27.json"))
+    except Exception as e:
+        print(f"  (player index unavailable: {type(e).__name__}: {e})")
+        player_index = None
+
+    resolved = resolve_player_overview_url(player_name, ratings_pool, player_index)
     if not resolved:
         raise SystemExit(
-            f"No player matching '{player_name}' found in your local ratings_fc27.json. "
+            f"No player matching '{player_name}' found in your local ratings_fc27.json "
+            f"or in fut.gg's player index. "
             f"Name matching is accent-insensitive and a substring match, but the player still needs "
             f"to be a current FC27 player in your local cache -- try re-running build_ratings_db.py "
             f"if they were only recently revealed."
@@ -700,6 +712,12 @@ def run_evolution(
 
     from fetch_ratings import fetch_page_text
     text = fetch_page_text(overview_url)
+    from player_history import parse_player_display_name
+    display_name = parse_player_display_name(text)
+    if display_name:
+        # The sitemap slug is accent-stripped, so prefer the page's own
+        # spelling ("Ousmane Dembele" -> "Ousmane Dembélé").
+        canonical_name = display_name
     year_cards = parse_fifa_history_page(text)
     if not year_cards:
         raise SystemExit(

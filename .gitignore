@@ -4,3 +4,6 @@ __pycache__/
 # Local crawl cache / seeds -- rebuilt via build_ratings_db.py, not source
 ratings_fc27.json
 ratings_seed_*.json
+
+# Sitemap-derived player index cache (rebuilt automatically)
+players_index_fc27.json
