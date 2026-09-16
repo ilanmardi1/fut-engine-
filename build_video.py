@@ -262,10 +262,26 @@ def run_topn(
             t = i * interval_seconds
             out_path = os.path.join(slides_dir, f"{_mmss(t)}{ext}")
 
-            real_card_path = _cached_screenshot(
-                shooter, p.detail_url, p.ea_id, p.game_year or "27", card_cache_dir,
-                debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
-            )
+            # Tier 1: fut.gg's standalone card asset -- plain HTTP, no
+            # browser, already transparent. Same source the evolution
+            # scenario prefers; far cheaper and cleaner than a screenshot.
+            real_card_path = None
+            if p.detail_url and p.ea_id:
+                try:
+                    card_url = fetch_card_image_url(
+                        p.detail_url, p.game_year or "27", p.ea_id, session=session)
+                except Exception as e:
+                    print(f"  ({p.name}: card-image lookup failed: {type(e).__name__}: {e})")
+                    card_url = None
+                if card_url:
+                    real_card_path = _cached_download(card_url, card_cache_dir,
+                                                      "topn_card", download_fn)
+
+            if not real_card_path:
+                real_card_path = _cached_screenshot(
+                    shooter, p.detail_url, p.ea_id, p.game_year or "27", card_cache_dir,
+                    debug_dir=os.path.join(card_cache_dir, "screenshot_debug"),
+                )
 
             if not real_card_path:
                 social_url = fetch_social_card_url(p, session=session)
@@ -274,7 +290,10 @@ def run_topn(
 
             if real_card_path:
                 if transparent:
-                    nobg_path = _cached_bg_removed(real_card_path, card_cache_dir, "topn")
+                    if _has_real_alpha(real_card_path):
+                        nobg_path = real_card_path   # already cut out by fut.gg
+                    else:
+                        nobg_path = _cached_bg_removed(real_card_path, card_cache_dir, "topn")
                     if nobg_path:
                         build_topn_slide_from_photo(out_path=out_path, rank=i + 1, real_card_path=nobg_path,
                                                      style=style, transparent=True)

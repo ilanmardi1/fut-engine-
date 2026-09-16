@@ -469,6 +469,76 @@ PLAYER_DETAIL_URL_RE = re.compile(
 )
 
 
+# fut.gg publishes a ranked leaderboard page per attribute, server-rendered
+# and already ordered best-first -- which is exactly what a "top N by <stat>"
+# video wants, and a better source than the old approach of crawling every
+# player and re-sorting locally (fut.gg's own ranking is authoritative and
+# one request replaces hundreds).
+#
+# Confirmed live 2026-09: 30 entries per page, ranks 1-30, server-rendered;
+# "?page=2" returns the SAME 30, so there is no deeper page to walk -- 30 is
+# the hard ceiling from this source.
+LEADERBOARD_URLS = {
+    "PAC": "https://www.fut.gg/players/fastest/",
+    "SHO": "https://www.fut.gg/players/best-shooters/",
+    "PAS": "https://www.fut.gg/players/best-passers/",
+    "DRI": "https://www.fut.gg/players/best-dribblers/",
+    "DEF": "https://www.fut.gg/players/best-defenders/",
+    "PHY": "https://www.fut.gg/players/most-physical/",
+}
+LEADERBOARD_MAX = 30
+
+# One entry per line: [#<rank>![<name> - <ovr> - <rarity>](<card img>)<name><rarity><val><STAT>...](<detail url>)
+LEADERBOARD_ENTRY_RE = re.compile(
+    r"\[#(?P<rank>\d+)!\[(?P<alt>[^\]]*?) - (?P<ovr>\d+) - (?P<rarity>[^\]]*?)\]"
+    r"\((?P<card_img>https://[^)]+)\)(?P<rest>[^\]]*?)\]\((?P<detail>/players/[^)]+)\)"
+)
+
+
+def fetch_leaderboard(stat: str, limit: int = LEADERBOARD_MAX,
+                      session: Optional[requests.Session] = None) -> list[PlayerRating]:
+    """fut.gg's ranked leaderboard for one of the six main attributes,
+    best-first, as PlayerRating objects.
+
+    Only the ranked stat is populated -- the leaderboard shows that plus
+    sub-attributes (Finishing, Sprint Speed, ...), NOT the other five main
+    stats, and carries no position. That is enough for a top-N video whose
+    slides use fut.gg's own card image, and is why this is not a general
+    replacement for the full ratings cache.
+
+    Raises KeyError for a stat with no leaderboard page."""
+    key = stat.upper()
+    if key not in LEADERBOARD_URLS:
+        raise KeyError(
+            f"No fut.gg leaderboard for '{stat}'. Available: "
+            f"{', '.join(sorted(LEADERBOARD_URLS))}")
+
+    text = fetch_page_text(LEADERBOARD_URLS[key], session)
+    players = []
+    for m in LEADERBOARD_ENTRY_RE.finditer(text):
+        # No trailing \b: the value runs straight into the next label
+        # ("93PACFinishing93Shot Power..."), so PAC is followed by a word
+        # character and a word-boundary anchor never matches. The leading
+        # digits are what disambiguate this from prose like "Short Passing".
+        lead = re.search(rf"(\d{{1,3}})\s*{key}", m.group("rest"))
+        detail = m.group("detail")
+        id_m = re.search(r"/players/(\d+)-[^/]+/(\d+)-(\d+)/", detail)
+        players.append(PlayerRating(
+            ea_id=id_m.group(3) if id_m else "",
+            name=m.group("alt").strip(),
+            club="",
+            position="",
+            ovr=int(m.group("ovr")),
+            stats={key: int(lead.group(1))} if lead else {},
+            rank=int(m.group("rank")),
+            card_image_url=m.group("card_img"),
+            detail_url="https://www.fut.gg" + detail,
+            game_year=id_m.group(2) if id_m else "",
+        ))
+    players.sort(key=lambda p: p.rank or 10**6)
+    return players[:limit]
+
+
 def fetch_player_index(game_year: str = "27", cache_path: Optional[str] = None,
                        session: Optional[requests.Session] = None,
                        refresh: bool = False) -> list[dict]:
