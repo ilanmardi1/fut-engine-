@@ -171,6 +171,48 @@ FIND_HISTORY_CARD_JS = r"""
 # Strips the page's own backgrounds off the chosen card and everything
 # behind it, so the element screenshot can be taken with a real alpha
 # channel (omit_background) instead of being cut out afterwards by rembg.
+# The card FRAME (gold border, OVR/name header) is a CSS background-image,
+# loaded separately from the <img> face. Capturing before it arrives yields
+# a card with its face and stats but no frame at all -- confirmed on Messi,
+# where FIFA 11 and 13 came out frameless while FIFA 12 beside them was
+# fine, i.e. a load race rather than a layout problem. Force every
+# background URL in the card's subtree to load, and wait for any pending
+# <img>, before capturing.
+AWAIT_CARD_ART_JS = r"""
+async (index) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  const el = cards[index];
+  if (!el) return false;
+
+  const urls = new Set();
+  for (const n of [el, ...el.querySelectorAll('*')]) {
+    const bg = getComputedStyle(n).backgroundImage;
+    if (!bg || bg === 'none') continue;
+    for (const m of bg.matchAll(/url\(["']?(.*?)["']?\)/g)) {
+      if (m[1]) urls.add(m[1]);
+    }
+  }
+
+  const waits = [];
+  for (const u of urls) {
+    waits.push(new Promise(res => {
+      const img = new Image();
+      img.onload = img.onerror = res;
+      img.src = u;
+      if (img.complete) res();
+    }));
+  }
+  for (const img of el.querySelectorAll('img')) {
+    if (!img.complete) {
+      waits.push(new Promise(res => { img.onload = img.onerror = res; }));
+    }
+  }
+  await Promise.all(waits);
+  return true;
+}
+"""
+
 CLEAR_BACKDROP_JS = r"""
 (index) => {
   const root = document.querySelector('#history') || document.body;
@@ -187,8 +229,8 @@ CLEAR_BACKDROP_JS = r"""
     }
   };
   stash(document.documentElement); stash(document.body);
-  document.documentElement.style.background = 'transparent';
-  document.body.style.background = 'transparent';
+  document.documentElement.style.backgroundColor = 'transparent';
+  document.body.style.backgroundColor = 'transparent';
 
   // Hide sticky/fixed chrome. scroll_into_view_if_needed can park a card
   // underneath fut.gg's sticky site header, and an element screenshot
@@ -201,11 +243,16 @@ CLEAR_BACKDROP_JS = r"""
       n.style.visibility = 'hidden';
     }
   });
+  // Clear only the background COLOR, never the image. The page's dark
+  // backdrop is a colour, but the card FRAME (gold border, OVR header) is
+  // a background-IMAGE that for some eras sits on an ancestor of the
+  // matched container rather than inside it -- blanking the `background`
+  // shorthand took the frame with it, which is why Messi's FIFA 11 and 13
+  // captured as a bare face and stats while FIFA 12 beside them was fine.
   let n = el.parentElement;
   while (n) {
     stash(n);
-    n.style.background = 'transparent';
-    n.style.backgroundImage = 'none';
+    n.style.backgroundColor = 'transparent';
     n.style.boxShadow = 'none';
     n.style.border = 'none';
     n = n.parentElement;
@@ -543,6 +590,10 @@ class CardScreenshotter:
                 os.makedirs(os.path.dirname(req["out_path"]) or ".", exist_ok=True)
                 loc.scroll_into_view_if_needed()
                 page.wait_for_timeout(200)
+                try:
+                    page.evaluate(AWAIT_CARD_ART_JS, found["index"])
+                except Exception:
+                    pass          # a slow asset is not worth failing the card over
                 page.evaluate(CLEAR_BACKDROP_JS, found["index"])
                 try:
                     page.wait_for_timeout(150)

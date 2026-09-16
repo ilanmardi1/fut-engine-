@@ -850,8 +850,17 @@ def run_evolution(
 
             if real_card_path:
                 if transparent:
-                    if _has_real_alpha(real_card_path):
-                        nobg_path = real_card_path   # already cut out by fut.gg
+                    # Tiers 1 and 2 already carry a real alpha channel: the
+                    # standalone asset ships pre-cut, and the archive capture
+                    # is taken with omit_background. Running rembg over those
+                    # is not just wasteful, it is destructive -- on the older
+                    # full-bleed card designs (Messi's FIFA 11/13) rembg keeps
+                    # the face and stats as "subject" and strips the gold
+                    # frame, which _has_real_alpha could not catch because
+                    # those cards fill their box with no transparent border.
+                    pre_cut = source_used in ("fut.gg card image", "fut.gg history card")
+                    if pre_cut or _has_real_alpha(real_card_path):
+                        nobg_path = real_card_path
                     else:
                         nobg_path = _cached_bg_removed(real_card_path, card_cache_dir, "evolution")
                     if nobg_path:
