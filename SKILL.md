@@ -79,19 +79,27 @@ CLI. Reasonable examples per scenario:
 - **evolution**: just a player name (accent-insensitive, e.g. "Dembele"
   finds "Ousmane Dembélé" -- don't ask the person to type accents).
 
-## Step 3 -- check the local ratings cache
+## Step 3 -- the local ratings cache (only some scenarios need it)
 
-Every scenario needs `ratings_fc27.json` sitting next to the scripts
-(topn/comparison/evolution use it directly; price uses it to find real
-screenshots by cross-referencing IDs). If it's missing:
-```
-python scripts/build_ratings_db.py
-```
-Takes a few minutes (crawls fut.gg's entire ratings list once). If it's
-present but the person mentions a player/team that seems obviously
-missing (a very recently revealed rating), suggest re-running this --
-FC27 ratings come out in batches, so a cache from a while ago can miss
-newer ones.
+`build_ratings_db.py` is CURRENTLY BROKEN against the live site: fut.gg
+moved its ratings listing (the old URL now redirects to a differently
+structured page) and the crawl completes with exit code 0 having saved
+ZERO players. Check the file has real content before trusting it --
+an empty `ratings_fc27.json` is the expected result right now, not a
+working cache.
+
+What that means per scenario:
+
+- **evolution** -- does NOT need the cache. It resolves the player from
+  fut.gg's sitemap index (~20k players, cached as
+  `players_index_fc27.json`, rebuilt automatically).
+- **topn** -- does NOT need the cache. It falls back to fut.gg's own
+  per-stat leaderboard, which is already ranked best-first. Limits: 30
+  players deep, best-first only (so `--slowest` still needs the cache).
+- **comparison** and **price** -- still need the cache, so both are
+  blocked until the crawler is rebuilt.
+
+If the cache DOES exist and has real players, every scenario prefers it.
 
 ## Step 4 -- run it
 
@@ -125,46 +133,10 @@ Confirmed from real runs, all handled automatically already:
   hand-drawn card using real scraped stats -- never fake/placeholder
   data, just a different visual source. A note prints when this
   happens; no action needed.
-- **evolution**: recent years (confirmed FIFA 22 onward, varies by
-  player) get real screenshots from their own detail page. Older years
-  with no individual detail page still get a real screenshot when
-  possible -- their actual card turns out to be rendered on the
-  player's overview page's "FIFA History" section, so this pipeline
-  screenshots THAT page and crops the specific card out. This is a
-  newer, less battle-tested code path than the individual-detail-page
-  screenshot method -- if it doesn't isolate a card correctly for some
-  player/year, it automatically falls back to the same real-stats
-  hand-drawn shield as before (no fake data either way, just a
-  different visual source). A note prints when a fallback happens; no
-  action needed unless it happens for EVERY older year for a player,
-  which would suggest the heuristic needs adjusting for that
-  particular page's layout.
-- **price with no --club-id/--league-id** (a fully global search):
-  defaults to a 20-page safety cap since an unscoped fetch's real size
-  has never been tested at full scale. The log will say if the real
-  total is bigger than what got fetched -- pass `--max-pages` higher if
-  a search comes back thinner than expected.
-- **`--league-id` on the price scenario specifically**: the query
-  parameter name on easysbc's side is an educated guess, not confirmed
-  -- `--club-id` is the fully confirmed path. If a league search
-  returns something that looks wrong, fall back to club-id and mention
-  this to the person.
-- **Background removal needs `rembg` installed** (`pip install
-  "rembg[cpu]"`, downloads a ~100-200MB model on first use, needs
-  network once for that). If it's missing, the pipeline still finishes
-  and prints a clear note per-image rather than crashing -- but the
-  whole point of this mode is transparent backgrounds, so if you see
-  that message repeatedly, stop and get `rembg` installed properly
-  before delivering the zip, rather than handing over backgrounds that
-  didn't actually get removed.
-
-## What NOT to do
-
-- Don't try to add CapCut integration back in -- that's the local
-  desktop tool's job, deliberately left out here.
-- Don't guess at flag names/values the person didn't give you for
-  filters they didn't mention -- omit them rather than inventing a
-  default that changes what shows up in the video.
-- Don't skip Step 3's ratings-cache check even if you think it's
-  probably already there -- the error message if it's missing is
-  much less useful mid-run than catching it up front.
+- **evolution**: every year now uses real fut.gg artwork. Recent years
+  come from fut.gg's standalone card asset (a plain HTTP fetch, already
+  transparent); older years have no downloadable asset at all, so they
+  are screenshotted out of the overview page's FIFA History archive in a
+  single page load. A year only falls back to the hand-drawn card if
+  both of those fail -- if you see "hand-drawn" in players.txt for a
+  modern player, something is wrong, not degraded.

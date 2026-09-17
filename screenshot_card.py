@@ -125,6 +125,154 @@ def fc_year_url(detail_url: str, ea_id: str, target_year: str) -> str:
     return re.sub(rf"/\d+-{re.escape(ea_id)}/?$", f"/{target_year}-{ea_id}/", detail_url)
 
 
+
+# Finds one card inside the "FIFA History" archive.
+#
+# Two keys are needed together, confirmed against real data:
+#  * OVR + position + all six stats, because a face image alone is NOT
+#    unique -- the same historical-player-face asset is reused across the
+#    page, and matching on it unscoped resolves to the "Best Cards" strip
+#    (Dembele's FIFA 21 face hit the 91-rated special, not the 83 Rare).
+#  * the face image id, because stats alone are NOT unique either -- a
+#    promo can carry stats identical to the base Rare. Confirmed: FIFA 18
+#    had 2 stat-matches and FIFA 20 had 3, and in both cases the FIRST was
+#    a promo design; only the face id picked out the real gold Rare.
+# Requiring both yielded exactly one candidate for every year tested.
+FIND_HISTORY_CARD_JS = r"""
+(spec) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  if (!cards.length) return {error: 'no card containers in history section'};
+
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const matches = [];
+  cards.forEach((el, idx) => {
+    const t = norm(el.innerText).toUpperCase();
+    if (!t) return;
+    // "<OVR> <POS> <NAME> <val><STAT> ..." -- anchor on OVR + position.
+    const head = new RegExp('^' + spec.ovr + '\\s+' + spec.position + '\\b');
+    if (!head.test(t)) return;
+    const statsOk = Object.entries(spec.stats).every(
+      ([k, v]) => new RegExp('\\b' + v + '\\s*' + k + '\\b').test(t));
+    if (!statsOk) return;
+    if (spec.face_id) {
+      const imgs = Array.from(el.querySelectorAll('img')).map(i => i.src);
+      const hit = imgs.some(src => src.includes('/' + spec.face_id + '.'));
+      if (!hit) return;
+    }
+    matches.push(idx);
+  });
+
+  if (!matches.length) return {error: 'no card matched', ovr: spec.ovr, position: spec.position};
+  return {index: matches[0], ambiguous: matches.length > 1, count: matches.length};
+}
+"""
+
+# Strips the page's own backgrounds off the chosen card and everything
+# behind it, so the element screenshot can be taken with a real alpha
+# channel (omit_background) instead of being cut out afterwards by rembg.
+# The card FRAME (gold border, OVR/name header) is a CSS background-image,
+# loaded separately from the <img> face. Capturing before it arrives yields
+# a card with its face and stats but no frame at all -- confirmed on Messi,
+# where FIFA 11 and 13 came out frameless while FIFA 12 beside them was
+# fine, i.e. a load race rather than a layout problem. Force every
+# background URL in the card's subtree to load, and wait for any pending
+# <img>, before capturing.
+AWAIT_CARD_ART_JS = r"""
+async (index) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  const el = cards[index];
+  if (!el) return false;
+
+  const urls = new Set();
+  for (const n of [el, ...el.querySelectorAll('*')]) {
+    const bg = getComputedStyle(n).backgroundImage;
+    if (!bg || bg === 'none') continue;
+    for (const m of bg.matchAll(/url\(["']?(.*?)["']?\)/g)) {
+      if (m[1]) urls.add(m[1]);
+    }
+  }
+
+  const waits = [];
+  for (const u of urls) {
+    waits.push(new Promise(res => {
+      const img = new Image();
+      img.onload = img.onerror = res;
+      img.src = u;
+      if (img.complete) res();
+    }));
+  }
+  for (const img of el.querySelectorAll('img')) {
+    if (!img.complete) {
+      waits.push(new Promise(res => { img.onload = img.onerror = res; }));
+    }
+  }
+  await Promise.all(waits);
+  return true;
+}
+"""
+
+CLEAR_BACKDROP_JS = r"""
+(index) => {
+  const root = document.querySelector('#history') || document.body;
+  const cards = Array.from(root.querySelectorAll('.hc-card-container, .fut-card-container'));
+  const el = cards[index];
+  if (!el) return false;
+  // Remember each element's own inline style so it can be put back. The
+  // ancestors here are SHARED between cards, so leaving them stripped
+  // reflows the page for every later capture -- that is what clipped one
+  // card's OVR block off in a batch run while it captured fine alone.
+  const stash = (n) => {
+    if (n.dataset.futPrevStyle === undefined) {
+      n.dataset.futPrevStyle = n.getAttribute('style') || '';
+    }
+  };
+  stash(document.documentElement); stash(document.body);
+  document.documentElement.style.backgroundColor = 'transparent';
+  document.body.style.backgroundColor = 'transparent';
+
+  // Hide sticky/fixed chrome. scroll_into_view_if_needed can park a card
+  // underneath fut.gg's sticky site header, and an element screenshot
+  // still captures whatever paints ON TOP of the element's box -- that is
+  // what put a dark strip across one year's OVR/position block.
+  document.querySelectorAll('body *').forEach(n => {
+    const pos = getComputedStyle(n).position;
+    if (pos === 'fixed' || pos === 'sticky') {
+      stash(n);
+      n.style.visibility = 'hidden';
+    }
+  });
+  // Clear only the background COLOR, never the image. The page's dark
+  // backdrop is a colour, but the card FRAME (gold border, OVR header) is
+  // a background-IMAGE that for some eras sits on an ancestor of the
+  // matched container rather than inside it -- blanking the `background`
+  // shorthand took the frame with it, which is why Messi's FIFA 11 and 13
+  // captured as a bare face and stats while FIFA 12 beside them was fine.
+  let n = el.parentElement;
+  while (n) {
+    stash(n);
+    n.style.backgroundColor = 'transparent';
+    n.style.boxShadow = 'none';
+    n.style.border = 'none';
+    n = n.parentElement;
+  }
+  return true;
+}
+"""
+
+RESTORE_BACKDROP_JS = r"""
+() => {
+  document.querySelectorAll('[data-fut-prev-style]').forEach(n => {
+    const prev = n.dataset.futPrevStyle;
+    if (prev) { n.setAttribute('style', prev); } else { n.removeAttribute('style'); }
+    delete n.dataset.futPrevStyle;
+  });
+  return true;
+}
+"""
+
+
 class CardScreenshotter:
     """Keeps one headless-Chromium instance open across many
     screenshot_card() calls -- use as a context manager so many players in
@@ -135,12 +283,72 @@ class CardScreenshotter:
             shooter.screenshot_card(url2, "239085", "27", "out2.png")
     """
 
-    def __init__(self, viewport: tuple[int, int] = (1600, 1200), headless: bool = True):
+    # Hosts whose responses are actually needed to render a card. Anything
+    # else (analytics, ads, session replay) is aborted: it cannot affect
+    # the card's pixels and every extra request costs a round trip through
+    # the fetch-via-Python transport below.
+    ALLOWED_HOST_SUFFIXES = ("fut.gg", "fonts.googleapis.com", "fonts.gstatic.com")
+
+    def __init__(self, viewport: tuple[int, int] = (1600, 1200), headless: bool = True,
+                 fetch_via_python: bool = True, device_scale_factor: float = 4.0):
         self.viewport = viewport
+        # Cards in the FIFA History archive render at only ~174x244 CSS px.
+        # Capturing at 1x would upscale badly onto a 1920x1080 slide, so
+        # screenshot at a higher device pixel ratio instead.
+        self.device_scale_factor = device_scale_factor
         self.headless = headless
+        # Route every request through Python's requests instead of letting
+        # Chromium open its own TLS connections.
+        #
+        # Why this exists: in a sandbox whose egress goes through a
+        # TLS-terminating proxy, Python is configured to trust the proxy's
+        # CA (REQUESTS_CA_BUNDLE etc.) but Chromium is not, so every
+        # page.goto() dies with ERR_CERT_AUTHORITY_INVALID before any card
+        # logic runs -- and because a failed screenshot is a silent
+        # fall-through here, that surfaced as blank cards rather than an
+        # error. Fulfilling each request from Python keeps verification
+        # fully ON (Python still validates against the proxy CA); it just
+        # moves who opens the socket. Set fetch_via_python=False to let
+        # Chromium talk to the network directly.
+        self.fetch_via_python = fetch_via_python
+        self._session = None
         self._pw = None
         self._browser = None
         self._page = None
+
+    def _install_python_transport(self, page) -> None:
+        import requests as _requests
+        from urllib.parse import urlparse
+
+        self._session = _requests.Session()
+        from fetch_ratings import USER_AGENT
+        self._session.headers.update({"User-Agent": USER_AGENT})
+
+        def _handler(route, request):
+            host = (urlparse(request.url).hostname or "").lower()
+            if not any(host == h or host.endswith("." + h) for h in self.ALLOWED_HOST_SUFFIXES):
+                route.abort()
+                return
+            try:
+                r = self._session.request(
+                    request.method, request.url,
+                    data=request.post_data_buffer, timeout=30,
+                )
+                # Drop hop-by-hop / encoding headers: requests has already
+                # decompressed the body, so passing the original
+                # content-encoding through would make Chromium try to
+                # decode it a second time.
+                headers = {k: v for k, v in r.headers.items()
+                           if k.lower() not in ("content-encoding", "content-length",
+                                                "transfer-encoding", "connection")}
+                route.fulfill(status=r.status_code, headers=headers, body=r.content)
+            except Exception:
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+
+        page.route("**/*", _handler)
 
     def __enter__(self) -> "CardScreenshotter":
         try:
@@ -153,14 +361,29 @@ class CardScreenshotter:
             ) from e
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=self.headless)
-        self._page = self._browser.new_page(viewport={"width": self.viewport[0], "height": self.viewport[1]})
+        self._page = self._browser.new_page(
+            viewport={"width": self.viewport[0], "height": self.viewport[1]},
+            device_scale_factor=self.device_scale_factor,
+        )
+        if self.fetch_via_python:
+            self._install_python_transport(self._page)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Routes still in flight when the page goes away raise
+        # CancelledError from Playwright's event loop; that is noise from
+        # shutdown ordering, not a failure of any screenshot.
+        if self._page:
+            try:
+                self._page.unroute_all(behavior="ignoreErrors")
+            except Exception:
+                pass
         if self._browser:
             self._browser.close()
         if self._pw:
             self._pw.stop()
+        if self._session:
+            self._session.close()
 
     def screenshot_card(
         self,
@@ -307,6 +530,84 @@ class CardScreenshotter:
                         f.write(f"Overview URL: {overview_url}\nScreenshot failed: {type(e).__name__}: {e}\n")
                 results[face_image_url] = False
 
+        return results
+
+    def screenshot_history_cards(
+        self,
+        overview_url: str,
+        requests: list,   # list of dicts: {key, ovr, position, stats, out_path}
+        debug_dir: Optional[str] = None,
+    ) -> dict:
+        """Screenshots each requested card out of the overview page's
+        "FIFA History" archive, matched by the OVR/position/stats already
+        parsed for that card (see FIND_HISTORY_CARD_JS for why face-image
+        matching is not safe here).
+
+        Navigates once, then captures every request against that same
+        loaded page. Uses Playwright's element screenshot rather than a
+        clipped page screenshot: the archive runs well below the fold, and
+        a clip cannot reach outside the viewport (the earlier attempt died
+        with "Clipped area is either empty or outside the resulting
+        image"), whereas an element screenshot scrolls itself into view.
+
+        Returns {key: True/False}. A False should fall back to the
+        hand-drawn card exactly as before."""
+        page = self._page
+        results = {r["key"]: False for r in requests}
+
+        def _debug(name: str, body: str) -> None:
+            if not debug_dir:
+                return
+            os.makedirs(debug_dir, exist_ok=True)
+            safe = re.sub(r"[^\w.-]", "_", name)
+            with open(os.path.join(debug_dir, f"history_{safe}_debug.txt"), "w", encoding="utf-8") as f:
+                f.write(body)
+
+        try:
+            self._goto_with_retry(page, overview_url)
+            # The archive is far down the page; scroll so it lays out.
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+        except Exception as e:
+            _debug("overview", f"URL: {overview_url}\nNavigation failed: {type(e).__name__}: {e}\n")
+            return results
+
+        selector = "#history .hc-card-container, #history .fut-card-container"
+        for req in requests:
+            key = req["key"]
+            try:
+                found = page.evaluate(FIND_HISTORY_CARD_JS, {
+                    "ovr": req["ovr"], "position": req["position"], "stats": req["stats"],
+                    "face_id": req.get("face_id"),
+                })
+                if "error" in found:
+                    _debug(key, f"URL: {overview_url}\nLooking for: {req}\nResult: {found}\n")
+                    continue
+                loc = page.locator(selector).nth(found["index"])
+                # Scroll first, THEN clear backdrops: clearing backgrounds on
+                # shared ancestors reflows the page, so a card measured
+                # before that can end up captured half off its own box.
+                os.makedirs(os.path.dirname(req["out_path"]) or ".", exist_ok=True)
+                loc.scroll_into_view_if_needed()
+                page.wait_for_timeout(200)
+                try:
+                    page.evaluate(AWAIT_CARD_ART_JS, found["index"])
+                except Exception:
+                    pass          # a slow asset is not worth failing the card over
+                page.evaluate(CLEAR_BACKDROP_JS, found["index"])
+                try:
+                    page.wait_for_timeout(150)
+                    loc.screenshot(path=req["out_path"], omit_background=True)
+                finally:
+                    # Always put the page back, so the next card in this
+                    # batch measures against the original layout.
+                    page.evaluate(RESTORE_BACKDROP_JS)
+                results[key] = True
+                if found.get("ambiguous"):
+                    print(f"  ({key}: {found['count']} cards matched those stats -- used the first)")
+            except Exception as e:
+                _debug(key, f"URL: {overview_url}\nLooking for: {req}\n"
+                            f"Screenshot failed: {type(e).__name__}: {e}\n")
         return results
 
     @staticmethod

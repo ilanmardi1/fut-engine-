@@ -439,6 +439,196 @@ SOCIAL_CARD_RE = re.compile(
 DELTA_RE = re.compile(r"(?P<sign>[+-])(?P<amt>\d+)\s*(?P<stat>OVR|PAC|SHO|PAS|DRI|DEF|PHY|DIV|HAN|KIC|REF|SPD|POS)")
 
 
+# fut.gg renders a standalone, already-transparent card image for each
+# player-item and serves it straight off its CDN, e.g.
+#   .../2027/futgg-player-item-card/27-231443.<hash>.webp
+# Confirmed live (2026-09) for EA FC 24-27; FIFA 22/23 detail pages carry
+# no such asset, so callers must keep a fallback for those years. This is
+# a strictly better card source than a browser screenshot: no browser at
+# all, and it arrives pre-cut with a real alpha channel, so it needs no
+# background removal either.
+CARD_IMAGE_RE_TMPL = (
+    r"https://game-assets\.fut\.gg/cdn-cgi/image/[^\"'\\\s]*?"
+    r"/futgg-player-item-card/{year}-{ea_id}\.[a-f0-9]+\.\w+"
+)
+
+
+# fut.gg publishes every player's detail URL in a paginated sitemap, which
+# is a far sturdier name -> URL lookup than scraping a ratings listing: it
+# is a stable, documented surface (linked from robots.txt) rather than a
+# rendered page whose markup changes. Confirmed live 2026-09: 22 sitemap
+# pages, 20,150 base players, ~20s to walk the lot.
+#
+# NOTE this carries NO ratings or stats -- only identity (ea_id, slug,
+# URL). It is enough for the evolution scenario, which needs just the
+# player's page, and is NOT a replacement for build_ratings_db.py, which
+# the stat-driven scenarios still need.
+SITEMAP_INDEX_URL = "https://www.fut.gg/sitemap.xml"
+PLAYER_DETAIL_URL_RE = re.compile(
+    r"^https://www\.fut\.gg/players/(?P<ea_id>\d+)-(?P<slug>[a-z0-9\-]+)/(?P<year>\d+)-(?P<item_id>\d+)/$"
+)
+
+
+# fut.gg publishes a ranked leaderboard page per attribute, server-rendered
+# and already ordered best-first -- which is exactly what a "top N by <stat>"
+# video wants, and a better source than the old approach of crawling every
+# player and re-sorting locally (fut.gg's own ranking is authoritative and
+# one request replaces hundreds).
+#
+# Confirmed live 2026-09: 30 entries per page, ranks 1-30, server-rendered;
+# "?page=2" returns the SAME 30, so there is no deeper page to walk -- 30 is
+# the hard ceiling from this source.
+LEADERBOARD_URLS = {
+    "PAC": "https://www.fut.gg/players/fastest/",
+    "SHO": "https://www.fut.gg/players/best-shooters/",
+    "PAS": "https://www.fut.gg/players/best-passers/",
+    "DRI": "https://www.fut.gg/players/best-dribblers/",
+    "DEF": "https://www.fut.gg/players/best-defenders/",
+    "PHY": "https://www.fut.gg/players/most-physical/",
+}
+LEADERBOARD_MAX = 30
+
+# One entry per line: [#<rank>![<name> - <ovr> - <rarity>](<card img>)<name><rarity><val><STAT>...](<detail url>)
+LEADERBOARD_ENTRY_RE = re.compile(
+    r"\[#(?P<rank>\d+)!\[(?P<alt>[^\]]*?) - (?P<ovr>\d+) - (?P<rarity>[^\]]*?)\]"
+    r"\((?P<card_img>https://[^)]+)\)(?P<rest>[^\]]*?)\]\((?P<detail>/players/[^)]+)\)"
+)
+
+
+def fetch_leaderboard(stat: str, limit: int = LEADERBOARD_MAX,
+                      session: Optional[requests.Session] = None) -> list[PlayerRating]:
+    """fut.gg's ranked leaderboard for one of the six main attributes,
+    best-first, as PlayerRating objects.
+
+    Only the ranked stat is populated -- the leaderboard shows that plus
+    sub-attributes (Finishing, Sprint Speed, ...), NOT the other five main
+    stats, and carries no position. That is enough for a top-N video whose
+    slides use fut.gg's own card image, and is why this is not a general
+    replacement for the full ratings cache.
+
+    Raises KeyError for a stat with no leaderboard page."""
+    key = stat.upper()
+    if key not in LEADERBOARD_URLS:
+        raise KeyError(
+            f"No fut.gg leaderboard for '{stat}'. Available: "
+            f"{', '.join(sorted(LEADERBOARD_URLS))}")
+
+    text = fetch_page_text(LEADERBOARD_URLS[key], session)
+    players = []
+    for m in LEADERBOARD_ENTRY_RE.finditer(text):
+        # No trailing \b: the value runs straight into the next label
+        # ("93PACFinishing93Shot Power..."), so PAC is followed by a word
+        # character and a word-boundary anchor never matches. The leading
+        # digits are what disambiguate this from prose like "Short Passing".
+        lead = re.search(rf"(\d{{1,3}})\s*{key}", m.group("rest"))
+        detail = m.group("detail")
+        id_m = re.search(r"/players/(\d+)-[^/]+/(\d+)-(\d+)/", detail)
+        players.append(PlayerRating(
+            ea_id=id_m.group(3) if id_m else "",
+            name=m.group("alt").strip(),
+            club="",
+            position="",
+            ovr=int(m.group("ovr")),
+            stats={key: int(lead.group(1))} if lead else {},
+            rank=int(m.group("rank")),
+            card_image_url=m.group("card_img"),
+            detail_url="https://www.fut.gg" + detail,
+            game_year=id_m.group(2) if id_m else "",
+        ))
+    players.sort(key=lambda p: p.rank or 10**6)
+    return players[:limit]
+
+
+def fetch_player_index(game_year: str = "27", cache_path: Optional[str] = None,
+                       session: Optional[requests.Session] = None,
+                       refresh: bool = False) -> list[dict]:
+    """Every base player for a game year, as
+    [{"ea_id", "slug", "name", "overview_url"}, ...].
+
+    Only entries whose item id equals the player's ea_id are kept -- those
+    are the base player items; every other id under the same slug is a
+    promo/special variant pointing at the same overview page.
+
+    Cached to disk (cache_path) because the walk costs ~20s; pass
+    refresh=True to rebuild."""
+    import json
+
+    if cache_path and not refresh and os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached:
+                return cached
+        except Exception:
+            pass   # unreadable cache is not fatal -- just rebuild it
+
+    sess = session or requests.Session()
+    index_xml = fetch_page_html(SITEMAP_INDEX_URL, sess)
+    maps = [u for u in re.findall(r"<loc>([^<]+)</loc>", index_xml)
+            if f"player-detail-{game_year}" in u]
+    if not maps:
+        raise RuntimeError(
+            f"No player sitemap for game year {game_year} at {SITEMAP_INDEX_URL} -- "
+            f"fut.gg may have renamed it.")
+
+    players = {}
+    for map_url in maps:
+        try:
+            xml = fetch_page_html(map_url, sess)
+        except Exception as e:
+            print(f"  (sitemap page failed: {map_url} -- {type(e).__name__}: {e})")
+            continue
+        for loc in re.findall(r"<loc>([^<]+)</loc>", xml):
+            m = PLAYER_DETAIL_URL_RE.match(loc)
+            if not m or m.group("ea_id") != m.group("item_id"):
+                continue
+            slug = m.group("slug")
+            players[m.group("ea_id")] = {
+                "ea_id": m.group("ea_id"),
+                "slug": slug,
+                "name": slug.replace("-", " "),
+                "overview_url": f"https://www.fut.gg/players/{m.group('ea_id')}-{slug}/",
+            }
+
+    result = list(players.values())
+    if cache_path and result:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f)
+        except Exception as e:
+            print(f"  (could not cache player index: {type(e).__name__}: {e})")
+    return result
+
+
+def fetch_page_html(url: str, session: Optional[requests.Session] = None) -> str:
+    """Raw HTML, unlike fetch_page_text() which reduces a page to a text
+    stream. Needed for anything living in an attribute or a <head> meta
+    tag -- BeautifulSoup's get_text() drops those entirely. (That is
+    exactly why fetch_social_card_url below, which searches the TEXT
+    stream for a "meta-og:image:" line, can never match on the live
+    site.)"""
+    sess = session or requests.Session()
+    resp = sess.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp.raise_for_status()
+    return resp.text
+
+
+def fetch_card_image_url(detail_url: str, game_year: str, ea_id: str,
+                         width: int = 900,
+                         session: Optional[requests.Session] = None) -> Optional[str]:
+    """Returns fut.gg's own standalone card image URL for one player-item,
+    upscaled to `width` via the cdn-cgi image params already in the URL.
+    Returns None when that year's page carries no such asset (confirmed
+    real for FIFA 22/23) -- callers should fall back, not treat it as an
+    error."""
+    html = fetch_page_html(detail_url, session)
+    pattern = CARD_IMAGE_RE_TMPL.format(year=re.escape(game_year), ea_id=re.escape(ea_id))
+    m = re.search(pattern, html)
+    if not m:
+        return None
+    return re.sub(r"width=\d+", f"width={width}", m.group(0))
+
+
 def fetch_social_card_url(player: PlayerRating, session: Optional[requests.Session] = None) -> Optional[str]:
     """Fetches player.detail_url and pulls out fut.gg's own fully-rendered
     social-preview card image URL (see SOCIAL_CARD_RE above). Returns

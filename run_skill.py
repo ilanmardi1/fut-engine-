@@ -41,6 +41,7 @@ from build_video import (
     fetch_all_easysbc_players, apply_easysbc_filters, sort_easysbc_players, parse_stat_filters, format_price,
     run_price, run_evolution,
 )
+from fetch_ratings import fetch_leaderboard
 
 
 def human_size(num_bytes: int) -> str:
@@ -140,10 +141,31 @@ def main():
     contents_label = args.scenario
 
     if args.scenario == "topn":
-        if not os.path.exists(args.ratings_db):
-            raise SystemExit(f"No ratings database found at '{args.ratings_db}'. Run: python build_ratings_db.py")
-        pool = load_ratings_db(args.ratings_db)
-        players = rank_by_stat(pool, args.stat, args.count, descending=not args.slowest)
+        players = []
+        if os.path.exists(args.ratings_db):
+            pool = load_ratings_db(args.ratings_db)
+            players = rank_by_stat(pool, args.stat, args.count, descending=not args.slowest)
+
+        if not players:
+            # No usable ratings cache. fut.gg publishes its own ranked
+            # leaderboard per attribute, which is authoritative for exactly
+            # this question -- but only best-first and only 30 deep.
+            if args.slowest:
+                raise SystemExit(
+                    f"--slowest needs a local ratings cache: fut.gg's leaderboards are "
+                    f"ranked best-first only. Run: python build_ratings_db.py")
+            try:
+                players = fetch_leaderboard(args.stat, limit=args.count)
+            except KeyError as e:
+                raise SystemExit(str(e).strip('"'))
+            if not players:
+                raise SystemExit(f"No players found for stat '{args.stat}'.")
+            print(f"(no ratings cache at '{args.ratings_db}' -- using fut.gg's "
+                  f"'{args.stat}' leaderboard instead)")
+            if args.count > len(players):
+                print(f"  (that leaderboard is {len(players)} deep, so this video has "
+                      f"{len(players)} slides, not {args.count})")
+
         if not players:
             raise SystemExit(f"No players found for stat '{args.stat}'.")
         for i, p in enumerate(players):
@@ -213,15 +235,26 @@ def main():
         contents_label = "price_prediction"
 
     elif args.scenario == "evolution":
-        if not os.path.exists(args.ratings_db):
-            raise SystemExit(f"No ratings database found at '{args.ratings_db}'. Run: python build_ratings_db.py")
-        ratings_pool = load_ratings_db(args.ratings_db)
+        # Unlike the stat-driven scenarios, evolution only needs the player's
+        # PAGE, and can resolve that from fut.gg's sitemap index. So a missing
+        # ratings cache is not fatal here -- it just means the slower lookup.
+        if os.path.exists(args.ratings_db):
+            ratings_pool = load_ratings_db(args.ratings_db)
+        else:
+            print(f"(no ratings cache at '{args.ratings_db}' -- resolving the player "
+                  f"from fut.gg's player index instead)")
+            ratings_pool = []
         year_cards = run_evolution(args.player_name, ratings_pool, slides_dir, card_cache_dir,
                                     args.interval_seconds, style,
                                     use_screenshots=not args.no_screenshots, transparent=True)
         for i, c in enumerate(year_cards):
-            source = "real screenshot" if c.has_real_screenshot_source else \
-                     "hand-drawn (real stats, no fut.gg detail page for this year)"
+            # Report the source that ACTUALLY produced the slide, not the
+            # one we hoped for -- a failed card/screenshot fetch silently
+            # falls back, and the contents list must not claim otherwise.
+            source = c.source_used or (
+                "real screenshot" if c.has_real_screenshot_source
+                else "hand-drawn (real stats, no fut.gg detail page for this year)"
+            )
             ovr_text = f"{c.ovr} OVR, " if c.ovr else ""
             players_lines.append(f"{i+1}. {c.year_label} -- {ovr_text}{source}")
         contents_label = _slugify(args.player_name)

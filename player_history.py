@@ -35,13 +35,28 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-YEAR_HEADER_RE = re.compile(r"^###\s+.+?\s+in\s+(EA FC (\d+)|FIFA (\d+))\s*$")
-LINK_ENTRY_RE = re.compile(r"^\[(.+?)\]\((https://www\.fut\.gg/players/[^)]+)\)$")
+# fut.gg dropped the "### " markdown-heading prefix on these year
+# headers (confirmed live 2026-09: the line is now just
+# "<Name> in EA FC 27"), so the prefix is optional here.
+YEAR_HEADER_RE = re.compile(r"^(?:###\s+)?.+?\s+in\s+(EA FC (\d+)|FIFA (\d+))\s*$")
+# Card links in the FIFA History section are now site-relative
+# ("/players/231443-ousmane-dembele/27-231443/") rather than
+# absolute; accept both and normalise to absolute below.
+LINK_ENTRY_RE = re.compile(r"^\[(.+?)\]\(((?:https://www\.fut\.gg)?/players/[^)]+)\)$")
 IMAGE_ENTRY_RE = re.compile(
     r"^!\[.*?\]\((https://game-assets\.fut\.gg/cdn-cgi/image/[^)]*?/historical-player-face/[^)]+)\)$"
 )
-STAT_NAMES = {"PAC", "SHO", "PAS", "DRI", "DEF", "PHY"}
-COMBINED_STAT_RE = re.compile(r"(\d{1,3})\s*(PAC|SHO|PAS|DRI|DEF|PHY)", re.IGNORECASE)
+# Outfield AND goalkeeper stat codes. Keeping this outfield-only meant a
+# keeper's cards parsed with an EMPTY stats dict, so every pre-FC24 year
+# fell through to a hand-drawn card labelled "NO stats available" --
+# confirmed against Donnarumma, whose FIFA 17-23 slides all came out that
+# way. GK cards use DIV/HAN/KIC/REF/SPD/POS in place of PAC/SHO/PAS/DRI/
+# DEF/PHY.
+OUTFIELD_STAT_NAMES = {"PAC", "SHO", "PAS", "DRI", "DEF", "PHY"}
+GK_STAT_NAMES = {"DIV", "HAN", "KIC", "REF", "SPD", "POS"}
+STAT_NAMES = OUTFIELD_STAT_NAMES | GK_STAT_NAMES
+COMBINED_STAT_RE = re.compile(
+    r"(\d{1,3})\s*(PAC|SHO|PAS|DRI|DEF|PHY|DIV|HAN|KIC|REF|SPD|POS)", re.IGNORECASE)
 
 
 @dataclass
@@ -53,6 +68,10 @@ class YearCard:
     ovr: Optional[int] = None
     position: Optional[str] = None
     stats: dict = field(default_factory=dict)
+    # Set by the builder to whatever card source ACTUALLY produced
+    # this slide, so the contents list can report the truth rather
+    # than re-deriving an intention from has_real_screenshot_source.
+    source_used: Optional[str] = None
 
     @property
     def has_real_screenshot_source(self) -> bool:
@@ -112,6 +131,42 @@ def _parse_entry_meta(entry_lines: list) -> dict:
     return {"ovr": ovr, "position": position, "stats": stats}
 
 
+INLINE_FACE_RE = re.compile(
+    r"!\[[^\]]*\]\((https://game-assets\.fut\.gg/[^)]*?/(?:historical-player-face|players)/[^)]+)\)"
+)
+INLINE_OVR_POS_RE = re.compile(r"(?<![\d])(\d{2,3})\s*([A-Z]{2,3})(?![A-Za-z])")
+
+
+def _parse_link_entry_meta(label: str) -> dict:
+    """Linked years put the whole card on ONE line, e.g.
+        [![Dembele](.../2022/players/231443.png)83RW![Nation](..)![Club](..)Dembele93PAC86DRI77SHO...](url)
+    so face/OVR/position/stats are all recoverable without another
+    request. The old parser kept only the URL and threw this away, which
+    left a linked year with NO usable fallback when its card image and
+    screenshot both failed -- producing a blank 0-OVR card. Confirmed
+    live (2026-09) against FIFA 22 and 23, the two years that have a
+    detail page but no standalone card asset."""
+    face_m = INLINE_FACE_RE.search(label)
+    face_url = face_m.group(1) if face_m else None
+
+    # Drop every ![alt](url) so image URLs can't be mined for digits.
+    stripped = re.sub(r"!\[[^\]]*\]\([^)]*\)", "|", label)
+
+    stats = {}
+    for value, name in COMBINED_STAT_RE.findall(stripped):
+        stats.setdefault(name.upper(), int(value))
+
+    # OVR/position is the first "<number><POS>" pair that is NOT a stat token.
+    ovr = position = None
+    for value, token in INLINE_OVR_POS_RE.findall(stripped):
+        if token.upper() in STAT_NAMES:
+            continue
+        ovr, position = int(value), token.upper()
+        break
+
+    return {"face_url": face_url, "ovr": ovr, "position": position, "stats": stats}
+
+
 def parse_fifa_history_page(text: str) -> list:
     """Returns one YearCard per year found, for the card explicitly
     labeled "Rare" in that year (exact match, case-insensitive -- never
@@ -124,15 +179,21 @@ def parse_fifa_history_page(text: str) -> list:
 
     entry_kind = None   # "link" or "image" or None
     entry_url = None
+    entry_label = None
     entry_face_url = None
     entry_lines: list = []
 
     def make_card_for_current_entry():
         if entry_kind == "link":
+            meta = _parse_link_entry_meta(entry_label or "")
             return YearCard(
                 year_label=current_year_label,
                 year_sort_key=_year_label_to_sort_key(current_year_label),
                 detail_url=entry_url,
+                face_image_url=meta["face_url"],
+                ovr=meta["ovr"],
+                position=meta["position"],
+                stats=meta["stats"],
             )
         meta = _parse_entry_meta(entry_lines)
         return YearCard(
@@ -164,6 +225,7 @@ def parse_fifa_history_page(text: str) -> list:
         if year_m:
             current_year_label = year_m.group(1)
             entry_kind, entry_url, entry_face_url, entry_lines = None, None, None, []
+            entry_label = None
             continue
 
         if current_year_label is None:
@@ -171,11 +233,16 @@ def parse_fifa_history_page(text: str) -> list:
 
         link_m = LINK_ENTRY_RE.match(line)
         if link_m:
-            entry_kind, entry_url, entry_face_url, entry_lines = "link", link_m.group(2), None, []
+            href = link_m.group(2)
+            if href.startswith("/"):
+                href = "https://www.fut.gg" + href
+            entry_label = link_m.group(1)
+            entry_kind, entry_url, entry_face_url, entry_lines = "link", href, None, []
             continue
 
         img_m = IMAGE_ENTRY_RE.match(line)
         if img_m:
+            entry_label = None
             entry_kind, entry_url, entry_face_url, entry_lines = "image", None, img_m.group(1), []
             continue
 
@@ -220,7 +287,75 @@ def _normalize_for_matching(s: str) -> str:
     return "".join(c for c in normalized if not unicodedata.combining(c)).lower()
 
 
-def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optional[tuple]:
+def _rank_index_matches(needle: str, hits: list) -> list:
+    """Orders sitemap hits so the obvious player wins. `hits` is a list of
+    (position, entry) where position is the entry's index in the sitemap.
+
+    Real ambiguity this has to survive: "dembele" matches Ousmane, Fatou
+    AND Karamoko; "mbappe" matches Kylian and Ethan.
+
+    Ties break on sitemap POSITION, which fut.gg orders by prominence --
+    verified: Kylian Mbappe sits at 20 and Ethan at 3208, Ousmane Dembele
+    at 44 against Fatou at 7466, Erling Haaland at 19 against Markus at
+    16019. An earlier version broke ties on the shorter name and duly
+    picked Ethan Mbappe for "Mbappe", which is exactly the wrong answer.
+    """
+    def score(item):
+        position, entry = item
+        name = _normalize_for_matching(entry["name"])
+        if name == needle:
+            tier = 0
+        elif name.split() and name.split()[-1] == needle:
+            tier = 1
+        elif name.startswith(needle + " ") or name.endswith(" " + needle):
+            tier = 2
+        else:
+            tier = 3
+        return (tier, position)
+    return [entry for _pos, entry in sorted(hits, key=score)]
+
+
+def resolve_player_from_index(player_name: str, index: list) -> Optional[tuple]:
+    """Name -> (overview_url, display_name) using the sitemap-derived player
+    index, for when the local ratings cache cannot answer. Prints the other
+    candidates when the name is ambiguous rather than silently guessing --
+    the caller can then re-run with a fuller name."""
+    needle = _normalize_for_matching(player_name.strip())
+    if not needle:
+        return None
+    hits = [(i, e) for i, e in enumerate(index)
+            if needle in _normalize_for_matching(e["name"])]
+    if not hits:
+        return None
+    ranked = _rank_index_matches(needle, hits)
+    best = ranked[0]
+    if len(ranked) > 1:
+        others = ", ".join(e["name"].title() for e in ranked[1:6])
+        print(f"  ('{player_name}' also matches: {others}"
+              f"{' ...' if len(ranked) > 6 else ''} -- using {best['name'].title()}; "
+              f"pass a fuller name to pick another)")
+    return best["overview_url"], best["name"].title()
+
+
+PLAYER_DISPLAY_NAME_RE = re.compile(
+    r"\[Players\]\(/players/\)\s*\n\s*/\s*\n\s*(?P<name>[^\n]+)"
+)
+
+
+def parse_player_display_name(text: str) -> Optional[str]:
+    """The player's correctly-accented name from their overview page's
+    breadcrumb. The sitemap slug is accent-stripped ("ousmane-dembele"), so
+    without this a sitemap-resolved player would render as "Ousmane Dembele"
+    on any hand-drawn card."""
+    m = PLAYER_DISPLAY_NAME_RE.search(text)
+    if not m:
+        return None
+    name = m.group("name").strip()
+    return name or None
+
+
+def resolve_player_overview_url(player_name: str, ratings_pool: list,
+                                fallback_index: Optional[list] = None) -> Optional[tuple]:
     """Finds a player's fut.gg overview URL (the FIFA History page) by
     name, using the ALREADY-CACHED ratings_fc27.json -- no new network
     dependency for name lookup. Works by trimming the last path segment
@@ -249,4 +384,9 @@ def resolve_player_overview_url(player_name: str, ratings_pool: list) -> Optiona
             url = p.detail_url.rstrip("/")
             overview_url = url.rsplit("/", 1)[0] + "/"
             return overview_url, p.name
+    # Nothing in the local ratings cache. That cache is currently empty for
+    # everyone whose build_ratings_db.py run failed, so fall back to the
+    # sitemap index, which needs no ratings data to answer.
+    if fallback_index:
+        return resolve_player_from_index(player_name, fallback_index)
     return None

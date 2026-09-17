@@ -1,5 +1,5 @@
 requests
 beautifulsoup4
 pillow
-playwright
+playwright==1.56.0   # pinned: must match the Chromium build available locally
 rembg[cpu]
