@@ -8,8 +8,9 @@ description: >
   FC27 for a club/league), price (market-price prediction via
   easysbc.io, with filters like position, per-stat min/max,
   price/rating range, skill moves, weak foot, preferred foot), and
-  evolution (one player's plain Rare gold card across every FIFA/EA FC
-  release, oldest to newest). Use whenever the person asks for a
+  evolution (one player's plain base card -- gold, silver or bronze --
+  across every FIFA/EA FC release, oldest to newest). Use whenever the
+  person asks for a
   FUT/FIFA/EA FC video, card slideshow, or names this skill. Always
   fetches live data from fut.gg and easysbc.io, aside from a local
   ratings_fc27.json crawl cache the person should refresh periodically.
@@ -55,7 +56,9 @@ Use natural language, not a jargon dump of flag names:
   (e.g. "La Liga cheap beasts: min 90 pace, min 80 dribble, max 10,000
   coins")
 - **"Evolution"** -- one player's card history across every FIFA/EA
-  FC release
+  FC release. Covers their base card each year whatever its quality:
+  a gold once they're rated for it, a silver or bronze before that
+  (fut.gg labels those "Common" rather than "Rare", and both count)
 
 ## Step 2 -- gather the inputs that scenario needs
 

@@ -3,20 +3,28 @@ player_history.py
 ------------------
 Fetches a player's full FIFA/EA FC version history from fut.gg's
 overview page (e.g. https://www.fut.gg/players/231443-ousmane-dembele/)
-and picks out just the plain "Rare" (base gold) card for each year --
-never TOTS/Icons/promos/TOTY/etc. Built and tested against a real,
-saved copy of that page (sample_futgg_history_fixture.txt), not
-synthetic data.
+and picks out just the plain BASE card for each year -- never
+TOTS/Icons/promos/TOTY/etc. Built and tested against a real, saved
+copy of that page (sample_futgg_history_fixture.txt), not synthetic
+data.
 
 CONFIRMED from a real fetch:
 - The overview page is server-rendered (same reliable pattern as every
   other fut.gg page this project already depends on) and its "FIFA
   History" section lists EVERY card ever released for that player,
   grouped by year, each with an explicit rarity label.
-- The exact rarity label to match is "Rare" -- confirmed there are
-  confusable rarity names that CONTAIN the word "rare" but are NOT the
-  base card (e.g. "Champions League Rare" in FIFA 21), so matching
-  must be an EXACT match (case-insensitive), never a substring check.
+- The rarity labels to match are "Rare" and "Common" -- confirmed
+  there are confusable rarity names that CONTAIN the word "rare" but
+  are NOT the base card (e.g. "Champions League Rare" in FIFA 21), so
+  matching must be an EXACT match (case-insensitive), never a
+  substring check.
+- Both labels are needed because a base item is only "Rare" once the
+  player is rated high enough; below that fut.gg labels it "Common",
+  which covers every bronze and silver AND low-rated golds. Confirmed
+  live: Pedri's FIFA 20/21 (72 OVR silvers), De Bruyne's FIFA 10 (64
+  bronze) and FIFA 13/14 (78/80 golds), Raphinha's FIFA 18 (76 gold)
+  are all "Common", and a Rare-only match silently dropped every one
+  of them -- starting Pedri's career at FIFA 22 instead of FIFA 20.
 - Recent years (confirmed FIFA 22 through FC 27) link each card to its
   own detail page, using the exact same URL pattern
   (.../{year}-{ea_id}/) our existing CardScreenshotter already knows
@@ -168,13 +176,25 @@ def _parse_link_entry_meta(label: str) -> dict:
 
 
 def parse_fifa_history_page(text: str) -> list:
-    """Returns one YearCard per year found, for the card explicitly
-    labeled "Rare" in that year (exact match, case-insensitive -- never
-    a substring match, since e.g. "Champions League Rare" is a real,
-    different, confusable rarity name that must NOT match)."""
+    """Returns one YearCard per year found, for that year's BASE card --
+    the entry explicitly labeled "Rare" or "Common" (exact match,
+    case-insensitive -- never a substring match, since e.g. "Champions
+    League Rare" is a real, different, confusable rarity name that must
+    NOT match).
+
+    "Common" matters because a base item is only a gold card once the
+    player is rated high enough; below that it is a silver or bronze,
+    which fut.gg labels "Common" rather than "Rare". Confirmed from a
+    real page: Pedri's FIFA 20 and FIFA 21 entries are both 72 OVR
+    "Common" silvers, and a Rare-only version silently dropped both,
+    starting his career at FIFA 22 instead of FIFA 20. Where one year
+    somehow carries both labels, "Rare" wins -- a player has exactly one
+    base item per year, so that can only mean an extra listed entry."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    year_results = {}  # year_label -> YearCard, replaced on each "Rare" match within that year
+    BASE_RARITIES = ("rare", "common")
+    year_results = {}   # year_label -> YearCard, replaced on each base-rarity match within that year
+    year_rarities = {}  # year_label -> which label ("rare"/"common") produced the stored card
     current_year_label = None
 
     entry_kind = None   # "link" or "image" or None
@@ -205,20 +225,26 @@ def parse_fifa_history_page(text: str) -> list:
             stats=meta["stats"],
         )
 
-    def flush_if_rare(rarity_text: str):
+    def flush_if_base(rarity_text: str):
         # Deliberately does NOT stop after the first match within a year:
         # a real, confirmed edge case (FIFA 17, at least for one real
         # player) has TWO entries both labeled exactly "Rare" in the same
         # year -- keeping the LAST match, not the first, matches the
         # pattern seen in every OTHER year on the same page, where the
-        # "Rare" entry is consistently the lowest-rated, final entry in
+        # base entry is consistently the lowest-rated, final entry in
         # that year's list (every other entry is strictly a higher-rated
-        # promo/upgrade above it).
-        if rarity_text.strip().lower() != "rare":
+        # promo/upgrade above it). That "last one wins" rule stays
+        # per-rarity, so a later "Common" never displaces a "Rare" the
+        # same year already produced.
+        rarity = rarity_text.strip().lower()
+        if rarity not in BASE_RARITIES:
             return
         if entry_kind is None:
             return
+        if year_rarities.get(current_year_label) == "rare" and rarity != "rare":
+            return
         year_results[current_year_label] = make_card_for_current_entry()
+        year_rarities[current_year_label] = rarity
 
     for line in lines:
         year_m = YEAR_HEADER_RE.match(line)
@@ -248,7 +274,7 @@ def parse_fifa_history_page(text: str) -> list:
 
         # A standalone rarity-label line closes out the current entry.
         # (Works for both "Rare"/"RARE" and every other rarity name --
-        # only "Rare" itself triggers flush_if_rare's actual capture.)
+        # only "Rare"/"Common" trigger flush_if_base's actual capture.)
         if entry_kind is not None and not line.startswith("!["):
             # Heuristic: a rarity label line is short prose with no digits
             # -- stat lines and OVR/position lines were already consumed
@@ -268,7 +294,7 @@ def parse_fifa_history_page(text: str) -> list:
                 continue
             # A likely rarity/label line (or the player's own name, for
             # "image" entries -- harmless to check both kinds here).
-            flush_if_rare(line)
+            flush_if_base(line)
             if entry_kind == "image":
                 entry_lines.append(line)  # harmless if it was the name, not consumed if rarity already flushed
             continue
